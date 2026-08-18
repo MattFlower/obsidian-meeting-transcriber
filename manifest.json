@@ -2,7 +2,7 @@
   "id": "obsidian-meeting-transcriber",
   "name": "Meeting Transcriber",
   "version": "0.1.0",
-  "minAppVersion": "1.4.0",
+  "minAppVersion": "1.7.2",
   "description": "Transcribe meeting audio files in your vault locally with Parakeet (ONNX via sherpa-onnx-node) and summarize/tag the notes with an LLM for easier search.",
   "author": "",
   "isDesktopOnly": true

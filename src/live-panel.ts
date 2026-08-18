@@ -1,4 +1,4 @@
-import { App, Modal, Notice, TFile } from "obsidian";
+import { ItemView, Notice, TFile, WorkspaceLeaf } from "obsidian";
 
 import {
   LiveAudioSource,
@@ -14,8 +14,8 @@ import { transcribe } from "./transcriber";
 import type { TranscriberSettings } from "./settings";
 
 /**
- * The slice of the plugin the modal needs. The plugin instance satisfies
- * this structurally, so the modal never reaches into plugin privates.
+ * The slice of the plugin the panel needs. The plugin instance satisfies
+ * this structurally, so the panel never reaches into plugin privates.
  */
 export interface LiveRecordingHost {
   settings: TranscriberSettings;
@@ -30,12 +30,12 @@ export interface LiveRecordingHost {
   /** True when any live recording session in the plugin is active. */
   isLiveSessionActive(): boolean;
   /**
-   * Claim the plugin-wide single live-session slot for this modal. Returns
-   * false (refusal) when another modal already holds the slot.
+   * Claim the plugin-wide single live-session slot for this panel. Returns
+   * false (refusal) when another panel already holds the slot.
    */
-  claimLiveSession(modal: LiveRecordingModal): boolean;
-  /** Release the slot (no-op if this modal no longer holds it). */
-  releaseLiveSession(modal: LiveRecordingModal): void;
+  claimLiveSession(panel: LiveRecordingPanel): boolean;
+  /** Release the slot (no-op if this panel no longer holds it). */
+  releaseLiveSession(panel: LiveRecordingPanel): void;
 }
 
 function clampChunkSeconds(value: number): number {
@@ -78,13 +78,15 @@ function correctTranscriptWord(
   return markdown;
 }
 
+export const LIVE_PANEL_VIEW_TYPE = "meeting-transcriber-live";
+
 /**
- * Interactive control for live meeting recording: pick the audio source
+ * Dockable control panel for live meeting recording: pick the audio source
  * (microphone or system audio) and input device, start/stop the session,
  * and pause/resume capture. Finished ~15 s chunks are transcribed with the
  * local Parakeet model and appended to the note as the meeting is spoken.
  */
-export class LiveRecordingModal extends Modal implements LiveSessionOwner {
+export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
   private readonly host: LiveRecordingHost;
   private readonly deps: LiveCaptureDeps;
   private readonly session: LiveRecordingSession;
@@ -95,6 +97,7 @@ export class LiveRecordingModal extends Modal implements LiveSessionOwner {
   private startBtn: HTMLButtonElement | null = null;
   private pauseBtn: HTMLButtonElement | null = null;
   private statusEl: HTMLElement | null = null;
+  private noteEl: HTMLElement | null = null;
 
   private timer: number | null = null;
   private note: TFile | null = null;
@@ -105,8 +108,8 @@ export class LiveRecordingModal extends Modal implements LiveSessionOwner {
   private startPending = false;
   private closed = false;
 
-  constructor(app: App, host: LiveRecordingHost) {
-    super(app);
+  constructor(leaf: WorkspaceLeaf, host: LiveRecordingHost) {
+    super(leaf);
     this.host = host;
     const md = navigator.mediaDevices;
     this.deps = {
@@ -134,26 +137,37 @@ export class LiveRecordingModal extends Modal implements LiveSessionOwner {
     });
   }
 
-  onOpen(): void {
+  getViewType(): string {
+    return LIVE_PANEL_VIEW_TYPE;
+  }
+
+  getDisplayText(): string {
+    return "Live meeting transcription";
+  }
+
+  getIcon(): string {
+    return "microphone";
+  }
+
+  async onOpen(): Promise<void> {
     this.closed = false;
-    this.setTitle("Transcribe live meeting");
     this.buildContent();
     void this.refreshDevices();
     this.updateStatus();
     this.timer = window.setInterval(() => this.tick(), 1000);
   }
 
-  onClose(): void {
+  async onClose(): Promise<void> {
     this.closed = true;
     if (this.timer !== null) {
       window.clearInterval(this.timer);
       this.timer = null;
     }
-    // Closing the modal while recording ends the session (flush + final
+    // Closing the panel while recording ends the session (flush + final
     // transcribe) rather than dropping the tail of the meeting. A pending
     // permission request keeps its claim until startSession() settles, so no
-    // other modal can begin capture in the meantime.
-    if (this.startPending) return;
+    // other panel can begin capture in the meantime.
+    if (this.startPending || this.stopping) return;
     if (this.session.isRecording()) {
       void this.stopSession().catch(() => undefined);
     } else {
@@ -161,7 +175,7 @@ export class LiveRecordingModal extends Modal implements LiveSessionOwner {
     }
   }
 
-  /** Whether this modal's capture is live (plugin-wide session owner). */
+  /** Whether this panel's capture is live (plugin-wide session owner). */
   isRecording(): boolean {
     return this.session.isRecording();
   }
@@ -225,6 +239,7 @@ export class LiveRecordingModal extends Modal implements LiveSessionOwner {
     });
 
     this.statusEl = content.createDiv({ cls: "live-recording-status" });
+    this.noteEl = content.createDiv({ cls: "live-recording-note" });
     this.updateStatus();
   }
 
@@ -234,18 +249,21 @@ export class LiveRecordingModal extends Modal implements LiveSessionOwner {
   }
 
   private updateStatus(): void {
-    if (!this.statusEl) return;
-    if (this.transcribing) {
-      this.statusEl.setText("Transcribing chunk…");
-      return;
+    if (this.statusEl) {
+      if (this.transcribing) {
+        const t = formatClock(this.session.elapsedSeconds());
+        this.statusEl.setText(`Transcribing chunk… ${t}`);
+      } else if (this.session.isRecording()) {
+        const t = formatClock(this.session.elapsedSeconds());
+        this.statusEl.setText(
+          this.session.isPaused() ? `⏸ Paused ${t}` : `● Recording ${t}`,
+        );
+      } else {
+        this.statusEl.setText("Idle");
+      }
     }
-    if (this.session.isRecording()) {
-      const t = formatClock(this.session.elapsedSeconds());
-      this.statusEl.setText(
-        this.session.isPaused() ? `⏸ Paused ${t}` : `● Recording ${t}`,
-      );
-    } else {
-      this.statusEl.setText("Idle");
+    if (this.noteEl) {
+      this.noteEl.setText(this.note ? `Writing to: ${this.note.path}` : "");
     }
   }
 
@@ -347,7 +365,7 @@ export class LiveRecordingModal extends Modal implements LiveSessionOwner {
     const deviceId = this.deviceSelect?.value || undefined;
 
     // Claim the plugin-wide slot before capture begins so a concurrent
-    // start from another modal is refused; released on every exit path.
+    // start from another panel is refused; released on every exit path.
     if (!this.host.claimLiveSession(this)) {
       new Notice(
         "A live recording is already in progress. Stop it before starting another.",

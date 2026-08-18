@@ -28,7 +28,10 @@ import {
   noteFileName,
   transcriptionNoteContent,
 } from "./note";
-import { LiveRecordingModal } from "./live-modal";
+import {
+  LiveRecordingPanel,
+  LIVE_PANEL_VIEW_TYPE,
+} from "./live-panel";
 import { LiveSessionRegistry } from "./live";
 
 /**
@@ -58,6 +61,11 @@ export default class MeetingTranscriberPlugin extends Plugin {
 
     this.statusBarItem = this.addStatusBarItem();
     this.setStatus("");
+
+    this.registerView(
+      LIVE_PANEL_VIEW_TYPE,
+      (leaf) => new LiveRecordingPanel(leaf, this),
+    );
 
     this.addCommand({
       id: "transcribe-audio-file",
@@ -89,45 +97,44 @@ export default class MeetingTranscriberPlugin extends Plugin {
       id: "transcribe-live-recording",
       name: "Transcribe live meeting (record audio)",
       callback: () => {
-        this.openLiveRecordingModal();
+        void this.openLiveRecordingPanel();
       },
     });
 
     this.addRibbonIcon("microphone", "Transcribe live meeting", () => {
-      this.openLiveRecordingModal();
+      void this.openLiveRecordingPanel();
     });
   }
 
-  /**
-   * Open the live-recording modal, refusing (with a Notice) while another
-   * live session is still recording.
-   */
-  private openLiveRecordingModal(): void {
-    if (this.liveSessions.isRecording()) {
-      new Notice(
-        "A live recording is already in progress. Stop it before starting another.",
-        10000,
-      );
+  /** Open the live-recording panel, or reveal it if it is already open. */
+  private async openLiveRecordingPanel(): Promise<void> {
+    const existing = this.app.workspace.getLeavesOfType(LIVE_PANEL_VIEW_TYPE);
+    if (existing.length > 0) {
+      await this.app.workspace.revealLeaf(existing[0]);
       return;
     }
-    new LiveRecordingModal(this.app, this).open();
+
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (!leaf) return;
+    await leaf.setViewState({ type: LIVE_PANEL_VIEW_TYPE, active: true });
+    await this.app.workspace.revealLeaf(leaf);
   }
 
   isLiveSessionActive(): boolean {
     return this.liveSessions.isRecording();
   }
 
-  claimLiveSession(modal: LiveRecordingModal): boolean {
-    return this.liveSessions.tryClaim(modal);
+  claimLiveSession(panel: LiveRecordingPanel): boolean {
+    return this.liveSessions.tryClaim(panel);
   }
 
-  releaseLiveSession(modal: LiveRecordingModal): void {
-    this.liveSessions.release(modal);
+  releaseLiveSession(panel: LiveRecordingPanel): void {
+    this.liveSessions.release(panel);
   }
 
   onunload(): void {
-    // Nothing to clean up; Obsidian removes registered commands and the
-    // status bar item for us.
+    this.app.workspace.detachLeavesOfType(LIVE_PANEL_VIEW_TYPE);
+    // Obsidian removes registered commands and the status bar item for us.
   }
 
   async loadSettings(): Promise<void> {

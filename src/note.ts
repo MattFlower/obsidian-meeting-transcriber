@@ -200,6 +200,59 @@ export function insertSummarySection(body: string, summary: string): string {
 }
 
 /**
+ * Append `text` as a new paragraph at the end of the `## Transcript`
+ * section (before the next `## ` heading, or end of file). When no
+ * `## Transcript` heading exists, the section is created at the end of the
+ * note. Repeated appends keep exactly one blank line between paragraphs
+ * (no blank-line pileup). Pure so it can be tested.
+ */
+export function appendToTranscriptSection(
+  markdown: string,
+  text: string,
+): string {
+  const trimmed = text.trim();
+  if (!trimmed) return markdown;
+
+  const lines = markdown.split("\n");
+  let headingIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s+Transcript\s*$/i.test(lines[i].trim())) {
+      headingIdx = i;
+      break;
+    }
+  }
+
+  if (headingIdx === -1) {
+    return `${markdown.replace(/\s+$/, "")}\n\n## Transcript\n\n${trimmed}\n`;
+  }
+
+  // End of the section: the next `## ` heading, or end of file.
+  let end = lines.length;
+  for (let i = headingIdx + 1; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+
+  // Existing section content, trimmed of surrounding blank lines so repeated
+  // appends do not accumulate blank lines.
+  let s = headingIdx + 1;
+  let e = end;
+  while (s < e && lines[s].trim() === "") s++;
+  while (e > s && lines[e - 1].trim() === "") e--;
+  const existing = lines.slice(s, e);
+
+  const before = lines.slice(0, headingIdx);
+  const after = lines.slice(end);
+  const section =
+    existing.length === 0
+      ? [lines[headingIdx], "", trimmed]
+      : [lines[headingIdx], "", ...existing, "", trimmed];
+  return [...before, ...section, "", ...after].join("\n");
+}
+
+/**
  * Split a note into its raw frontmatter prefix (the `---` block plus a blank
  * separator line, or "" when there is none) and the body that follows. The
  * prefix is the exact original text, so recombining it with a modified body

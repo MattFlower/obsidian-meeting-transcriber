@@ -1,5 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type MeetingTranscriberPlugin from "./main";
+import type { LiveAudioSource } from "./live";
 
 export interface TranscriberSettings {
   /** Vault-relative directory holding the Parakeet ONNX model files. */
@@ -14,6 +15,10 @@ export interface TranscriberSettings {
   llmModel: string;
   /** Tags added to every new transcription note. */
   defaultTags: string[];
+  /** Pre-selected source for the live recording modal. */
+  liveAudioSource: LiveAudioSource;
+  /** Seconds of audio per live transcription chunk (clamped 5–60). */
+  liveChunkSeconds: number;
 }
 
 export const DEFAULT_SETTINGS: TranscriberSettings = {
@@ -23,6 +28,8 @@ export const DEFAULT_SETTINGS: TranscriberSettings = {
   llmApiKey: "",
   llmModel: "gpt-4o-mini",
   defaultTags: ["meeting"],
+  liveAudioSource: "microphone",
+  liveChunkSeconds: 15,
 };
 
 export class TranscriberSettingTab extends PluginSettingTab {
@@ -122,6 +129,48 @@ export class TranscriberSettingTab extends PluginSettingTab {
               .split(",")
               .map((t) => t.trim())
               .filter((t) => t.length > 0);
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Live recording source")
+      .setDesc(
+        "Pre-selected source for the 'Transcribe live meeting' modal. " +
+          "System audio capture is not exposed to Obsidian on most " +
+          "platforms: on macOS install a loopback driver (e.g. BlackHole) " +
+          "and select it as the input device; on Windows use Stereo Mix / " +
+          "VB-CABLE or screen-share audio; on Linux select a " +
+          "PulseAudio/PipeWire monitor source. The plugin will never " +
+          "silently fall back to the microphone.",
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("microphone", "Microphone")
+          .addOption("system", "System audio")
+          .setValue(this.plugin.settings.liveAudioSource)
+          .onChange(async (value) => {
+            this.plugin.settings.liveAudioSource = value as LiveAudioSource;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Live chunk length (seconds)")
+      .setDesc(
+        "How often live audio is transcribed and appended to the note " +
+          "(5–60, default 15).",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("15")
+          .setValue(String(this.plugin.settings.liveChunkSeconds))
+          .onChange(async (value) => {
+            const parsed = parseInt(value, 10);
+            const clamped = Number.isFinite(parsed)
+              ? Math.min(60, Math.max(5, parsed))
+              : 15;
+            this.plugin.settings.liveChunkSeconds = clamped;
             await this.plugin.saveSettings();
           }),
       );

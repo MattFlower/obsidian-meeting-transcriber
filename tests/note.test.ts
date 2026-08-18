@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  appendToTranscriptSection,
   applySummary,
   applySummaryToBody,
   emitFrontmatter,
@@ -214,6 +215,89 @@ describe("insertSummarySection", () => {
     const out = insertSummarySection("# T\n\nbody", "S");
     expect(out).toContain("## Summary");
     expect(out.trimEnd().endsWith("S")).toBe(true);
+  });
+});
+
+describe("appendToTranscriptSection", () => {
+  it("appends a new paragraph at the end of the Transcript section", () => {
+    const out = appendToTranscriptSection(sampleNote, "Carol: Next item.");
+    expect(out).toContain("Alice: Let's ship it.");
+    expect(out).toContain("Bob: Agreed.");
+    expect(out).toContain("Carol: Next item.");
+    // The appended text comes after the existing transcript text.
+    expect(out.indexOf("Carol: Next item.")).toBeGreaterThan(
+      out.indexOf("Bob: Agreed."),
+    );
+    // Frontmatter and title are untouched.
+    expect(parseFrontmatter(out).data.source).toBe("[[audio/team-sync.mp3]]");
+    expect(out).toContain("# 2026-08-18 team sync");
+  });
+
+  it("preserves a following ## section", () => {
+    const md =
+      "# T\n\n## Transcript\n\nfirst\n\n## Action items\n\n- do thing\n";
+    const out = appendToTranscriptSection(md, "second");
+    expect(out).toContain("## Action items");
+    expect(out).toContain("- do thing");
+    // The new paragraph lands inside the Transcript section, before the
+    // next heading.
+    expect(out.indexOf("second")).toBeLessThan(
+      out.indexOf("## Action items"),
+    );
+    expect(out.indexOf("second")).toBeGreaterThan(
+      out.indexOf("## Transcript"),
+    );
+  });
+
+  it("creates the Transcript section when it is absent", () => {
+    const out = appendToTranscriptSection("# T\n\nbody", "hello");
+    expect(out).toContain("## Transcript");
+    expect(out).toContain("hello");
+    expect(out.indexOf("## Transcript")).toBeGreaterThan(out.indexOf("body"));
+    expect(out.trimEnd().endsWith("hello")).toBe(true);
+  });
+
+  it("starts an empty Transcript section without extra blank lines", () => {
+    const empty = transcriptionNoteContent({
+      title: "2026-08-18 live",
+      date: "2026-08-18 0900",
+      audioLink: "live-microphone",
+      transcript: "",
+      tags: ["meeting"],
+    });
+    const out = appendToTranscriptSection(empty, "first words");
+    expect(out).toContain("## Transcript\n\nfirst words\n");
+  });
+
+  it("does not pile up blank lines across repeated appends", () => {
+    let md = transcriptionNoteContent({
+      title: "2026-08-18 live",
+      date: "2026-08-18 0900",
+      audioLink: "live-microphone",
+      transcript: "",
+      tags: ["meeting"],
+    });
+    md = appendToTranscriptSection(md, "chunk one");
+    const once = md;
+    md = appendToTranscriptSection(md, "chunk two");
+    md = appendToTranscriptSection(md, "chunk three");
+    expect(md).toContain("chunk one\n\nchunk two\n\nchunk three");
+    // Exactly one blank line between paragraphs, no pileup.
+    const section = md.split("## Transcript")[1];
+    expect(section.match(/\n\n\n/g) ?? []).toHaveLength(0);
+    // Re-appending the same note state is stable in shape.
+    expect(appendToTranscriptSection(once, "chunk two")).toBe(
+      appendToTranscriptSection(once, "chunk two"),
+    );
+  });
+
+  it("trims the appended text and ignores empty input", () => {
+    const md = "# T\n\n## Transcript\n\nfirst\n";
+    const out = appendToTranscriptSection(md, "  \n  padded text  \n");
+    expect(out).toContain("padded text");
+    expect(out).not.toContain("  padded");
+    expect(appendToTranscriptSection(md, "   ")).toBe(md);
+    expect(appendToTranscriptSection(md, "")).toBe(md);
   });
 });
 

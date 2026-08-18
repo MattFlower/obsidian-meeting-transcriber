@@ -28,12 +28,17 @@ import {
   noteFileName,
   transcriptionNoteContent,
 } from "./note";
+import { LiveRecordingModal } from "./live-modal";
+import { LiveSessionRegistry } from "./live";
 
 /**
  * Meeting Transcriber
  *
  * - Transcribes an audio file already in the vault into a note using the
  *   Parakeet TDT 0.6B v2 (int8) model running locally via sherpa-onnx-node.
+ * - Records a live meeting (microphone or system audio) and appends the
+ *   transcript to a note in ~15 s chunks as the meeting is spoken, with
+ *   pause/resume support.
  * - Summarizes a transcription note with an OpenAI-compatible LLM, adding
  *   tags + a description to the frontmatter and a `## Summary` section so the
  *   note is easier to search later.
@@ -44,6 +49,8 @@ import {
 export default class MeetingTranscriberPlugin extends Plugin {
   settings: TranscriberSettings = DEFAULT_SETTINGS;
   private statusBarItem: HTMLElement | null = null;
+  /** Plugin-wide coordination: at most one live recording session at a time. */
+  private liveSessions = new LiveSessionRegistry();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -77,6 +84,45 @@ export default class MeetingTranscriberPlugin extends Plugin {
         void this.summarizeActiveOrSuggested();
       },
     });
+
+    this.addCommand({
+      id: "transcribe-live-recording",
+      name: "Transcribe live meeting (record audio)",
+      callback: () => {
+        this.openLiveRecordingModal();
+      },
+    });
+
+    this.addRibbonIcon("microphone", "Transcribe live meeting", () => {
+      this.openLiveRecordingModal();
+    });
+  }
+
+  /**
+   * Open the live-recording modal, refusing (with a Notice) while another
+   * live session is still recording.
+   */
+  private openLiveRecordingModal(): void {
+    if (this.liveSessions.isRecording()) {
+      new Notice(
+        "A live recording is already in progress. Stop it before starting another.",
+        10000,
+      );
+      return;
+    }
+    new LiveRecordingModal(this.app, this).open();
+  }
+
+  isLiveSessionActive(): boolean {
+    return this.liveSessions.isRecording();
+  }
+
+  claimLiveSession(modal: LiveRecordingModal): boolean {
+    return this.liveSessions.tryClaim(modal);
+  }
+
+  releaseLiveSession(modal: LiveRecordingModal): void {
+    this.liveSessions.release(modal);
   }
 
   onunload(): void {
@@ -92,7 +138,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
-  private setStatus(text: string): void {
+  setStatus(text: string): void {
     if (this.statusBarItem) {
       this.statusBarItem.setText(text);
     }
@@ -176,14 +222,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
    * absolute path, not the vault-relative setting. Returns null when the vault
    * adapter is not the desktop file-system adapter.
    */
-  private resolveModelDir(): string | null {
+  resolveModelDir(): string | null {
     const adapter = this.app.vault.adapter;
     if (!(adapter instanceof FileSystemAdapter)) return null;
     const dir = path.join(adapter.getBasePath(), this.settings.modelDir);
     return dir.split(path.sep).join("/");
   }
 
-  private findMissingModelFiles(): string[] {
+  findMissingModelFiles(): string[] {
     const modelDirAbs = this.resolveModelDir();
     if (!modelDirAbs) return ["<non-desktop adapter>"];
     const paths = modelFilePaths(modelDirAbs);
@@ -194,6 +240,20 @@ export default class MeetingTranscriberPlugin extends Plugin {
     file: TFile,
     transcript: string,
   ): Promise<void> {
+    await this.createNote(file.basename, `[[${file.path}]]`, transcript);
+  }
+
+  /**
+   * Create a transcription note in the output folder and return the created
+   * `TFile`. Shared by the file-based and the live-recording paths: `baseName`
+   * becomes the note title suffix, `sourceLabel` the frontmatter `source`
+   * value (a `[[link]]` for files, `live-<source>` for recordings).
+   */
+  async createNote(
+    baseName: string,
+    sourceLabel: string,
+    transcript: string,
+  ): Promise<TFile> {
     const vault = this.app.vault;
     const folder = this.settings.outputFolder.replace(/^\/+|\/+$/g, "");
     if (folder) {
@@ -208,7 +268,6 @@ export default class MeetingTranscriberPlugin extends Plugin {
     }
 
     const now = new Date();
-    const baseName = file.basename;
     const fileName = noteFileName(now, baseName);
     const dir = folder ? `${folder}/` : "";
     const notePath = `${dir}${fileName}`;
@@ -217,7 +276,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     const content = transcriptionNoteContent({
       title,
       date: now.toISOString().slice(0, 16).replace("T", " "),
-      audioLink: `[[${file.path}]]`,
+      audioLink: sourceLabel,
       transcript,
       tags: [...this.settings.defaultTags],
     });
@@ -227,10 +286,9 @@ export default class MeetingTranscriberPlugin extends Plugin {
       const stem = fileName.replace(/\.md$/, "");
       const suffix = `${now.getTime()}`;
       const altPath = `${dir}${stem} ${suffix}.md`;
-      await vault.create(altPath, content);
-      return;
+      return vault.create(altPath, content);
     }
-    await vault.create(notePath, content);
+    return vault.create(notePath, content);
   }
 
   // ---------------------------------------------------------------------

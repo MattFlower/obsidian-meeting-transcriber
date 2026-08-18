@@ -8,6 +8,9 @@ main.js
 *.onnx
 models/
 
+# macos
+.DS_Store
+
 # sssf runtime
 adws/adw_data/sessions/
 adws/adw_data/sssf.db*

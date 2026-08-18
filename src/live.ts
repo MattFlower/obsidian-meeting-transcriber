@@ -25,10 +25,118 @@ export interface LiveChunkerOptions {
   /**
    * Seconds of overlap between consecutive chunks (default 0.5). Each
    * emitted chunk begins `overlapSeconds` before the previous chunk ended,
-   * so words split at a boundary are still recognized. Words duplicated at
-   * the seams are accepted — there is no de-duplication.
+   * so words split at a boundary are still recognized. TranscriptOverlapDeduper
+   * removes duplicated seam text downstream in the modal's append path.
    */
   overlapSeconds?: number;
+}
+
+const TRANSCRIPT_TAIL_WORDS = 20;
+
+function normalizeTranscriptWord(word: string): string {
+  return word
+    .toLocaleLowerCase()
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+}
+
+/**
+ * Removes words repeated where consecutive overlapping audio chunks meet.
+ * Pure (no I/O) so the live append path can be tested headlessly.
+ */
+interface TranscriptWord {
+  normalized: string;
+  original: string;
+}
+
+export interface TranscriptWordCorrection {
+  previous: string;
+  replacement: string;
+}
+
+export class TranscriptOverlapDeduper {
+  private prevWords: TranscriptWord[] = [];
+  private correction: TranscriptWordCorrection | null = null;
+
+  /** Return `text` without a prefix already emitted by the previous chunk. */
+  append(text: string): string {
+    this.correction = null;
+    const matches = Array.from(text.matchAll(/\S+/g));
+    if (matches.length === 0) return "";
+
+    const words = matches.map((match) => ({
+      normalized: normalizeTranscriptWord(match[0]),
+      original: match[0],
+    }));
+    const maxOverlap = Math.min(this.prevWords.length, words.length);
+    let overlap = 0;
+
+    for (let size = maxOverlap; size > 0; size--) {
+      const previousStart = this.prevWords.length - size;
+      let equal = true;
+      for (let index = 0; index < size; index++) {
+        const previous = this.prevWords[previousStart + index].normalized;
+        const next = words[index].normalized;
+        const exactMatch = previous.length > 0 && previous === next;
+        // The word nearest the end of the previous transcript can be clipped
+        // by the ASR at the audio boundary ("transcri" / "transcription").
+        const clippedMatch =
+          index === size - 1 &&
+          previous.length > 0 &&
+          next.length > 0 &&
+          (previous.startsWith(next) || next.startsWith(previous));
+        if (!exactMatch && !clippedMatch) {
+          equal = false;
+          break;
+        }
+      }
+      if (equal) {
+        overlap = size;
+        break;
+      }
+    }
+
+    if (overlap > 0) {
+      const previousWord = this.prevWords[this.prevWords.length - 1];
+      const nextWord = words[overlap - 1];
+      if (
+        previousWord.normalized !== nextWord.normalized &&
+        nextWord.normalized.startsWith(previousWord.normalized)
+      ) {
+        // The new chunk recognized a fuller version of the clipped word.
+        // Tell the append path to correct the already-written final word.
+        this.correction = {
+          previous: previousWord.original,
+          replacement: nextWord.original,
+        };
+        this.prevWords[this.prevWords.length - 1] = nextWord;
+      }
+    }
+
+    const emittedWords = words.filter((word, index) =>
+      index >= overlap && word.normalized.length > 0,
+    );
+    this.prevWords = this.prevWords
+      .concat(emittedWords)
+      .slice(-TRANSCRIPT_TAIL_WORDS);
+
+    if (overlap === 0) return text;
+    if (overlap === matches.length) return "";
+    const firstRemaining = matches[overlap];
+    return text.slice(firstRemaining.index ?? 0).trimStart();
+  }
+
+  /** Return a fuller replacement for a clipped word matched by the last append. */
+  takeCorrection(): TranscriptWordCorrection | null {
+    const correction = this.correction;
+    this.correction = null;
+    return correction;
+  }
+
+  /** Forget transcript state at the start of a new recording session. */
+  reset(): void {
+    this.prevWords = [];
+    this.correction = null;
+  }
 }
 
 /**

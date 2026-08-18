@@ -4,6 +4,7 @@ import {
   LiveChunker,
   LiveRecordingSession,
   LiveSessionRegistry,
+  TranscriptOverlapDeduper,
   type LiveCaptureDeps,
   type LiveSessionOwner,
   SYSTEM_AUDIO_UNAVAILABLE,
@@ -164,6 +165,78 @@ function feed(ctx: FakeAudioContext, samples: Float32Array): void {
 }
 
 // ---------------------------------------------------------------------------
+
+describe("TranscriptOverlapDeduper", () => {
+  it("removes duplicated words across a chunk seam", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    const first = deduper.append("hello world this is");
+    const second = deduper.append("this is a test");
+
+    expect(second).toBe("a test");
+    expect(`${first} ${second}`).toBe("hello world this is a test");
+  });
+
+  it("does not truncate words when consecutive chunks do not overlap", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("hello world");
+    expect(deduper.append("goodbye now")).toBe("goodbye now");
+  });
+
+  it("returns the first chunk unchanged and reset clears prior state", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    expect(deduper.append("  First chunk.  ")).toBe("  First chunk.  ");
+    deduper.reset();
+    expect(deduper.append("First chunk continues")).toBe(
+      "First chunk continues",
+    );
+  });
+
+  it("matches overlap despite case and edge punctuation differences", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("Earlier words, the quick, brown fox");
+    expect(deduper.append("The quick brown fox jumps")).toBe("jumps");
+  });
+
+  it("replaces a clipped seam word with the fuller recognition", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    const first = deduper.append("we discussed transcri");
+    const second = deduper.append("transcription of the meeting");
+    const correction = deduper.takeCorrection();
+    const correctedFirst = correction
+      ? first.replace(correction.previous, correction.replacement)
+      : first;
+
+    expect(second).toBe("of the meeting");
+    expect(`${correctedFirst} ${second}`).toBe(
+      "we discussed transcription of the meeting",
+    );
+    expect(`${correctedFirst} ${second}`.match(/transcription/g)).toHaveLength(1);
+  });
+
+  it("consumes a chunk that is entirely duplicated", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("one two three four");
+    expect(deduper.append("three four")).toBe("");
+  });
+
+  it("de-duplicates a chain of overlapping chunks", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    const emitted = [
+      deduper.append("one two three"),
+      deduper.append("two three four five"),
+      deduper.append("four five six seven"),
+    ].filter(Boolean);
+
+    expect(emitted.join(" ")).toBe("one two three four five six seven");
+  });
+
+  it("ignores an empty append without changing state", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("hello seam");
+    expect(deduper.append("")).toBe("");
+    expect(deduper.append("seam continues")).toBe("continues");
+  });
+});
 
 describe("LiveChunker", () => {
   it("emits nothing until a full chunk has accumulated", () => {

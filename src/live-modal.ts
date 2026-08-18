@@ -6,6 +6,8 @@ import {
   LiveRecordingSession,
   LiveSessionOwner,
   SYSTEM_AUDIO_UNAVAILABLE,
+  TranscriptOverlapDeduper,
+  type TranscriptWordCorrection,
 } from "./live";
 import { appendToTranscriptSection } from "./note";
 import { transcribe } from "./transcriber";
@@ -48,6 +50,34 @@ function formatClock(totalSeconds: number): string {
   return `${mm}:${ss}`;
 }
 
+function correctTranscriptWord(
+  markdown: string,
+  correction: TranscriptWordCorrection,
+): string {
+  const heading = /^##\s+Transcript\s*$/gim.exec(markdown);
+  if (!heading) return markdown;
+
+  const sectionStart = heading.index + heading[0].length;
+  const afterHeading = markdown.slice(sectionStart);
+  const nextHeading = /^##\s+/gm.exec(afterHeading);
+  const sectionEnd =
+    nextHeading === null ? markdown.length : sectionStart + nextHeading.index;
+  const section = markdown.slice(sectionStart, sectionEnd);
+  const words = Array.from(section.matchAll(/\S+/g));
+
+  for (let index = words.length - 1; index >= 0; index--) {
+    const word = words[index];
+    if (word[0] !== correction.previous) continue;
+    const wordStart = sectionStart + (word.index ?? 0);
+    return (
+      markdown.slice(0, wordStart) +
+      correction.replacement +
+      markdown.slice(wordStart + word[0].length)
+    );
+  }
+  return markdown;
+}
+
 /**
  * Interactive control for live meeting recording: pick the audio source
  * (microphone or system audio) and input device, start/stop the session,
@@ -58,6 +88,7 @@ export class LiveRecordingModal extends Modal implements LiveSessionOwner {
   private readonly host: LiveRecordingHost;
   private readonly deps: LiveCaptureDeps;
   private readonly session: LiveRecordingSession;
+  private readonly deduper = new TranscriptOverlapDeduper();
 
   private sourceSelect: HTMLSelectElement | null = null;
   private deviceSelect: HTMLSelectElement | null = null;
@@ -368,6 +399,7 @@ export class LiveRecordingModal extends Modal implements LiveSessionOwner {
 
     this.producedText = false;
     this.pump = Promise.resolve();
+    this.deduper.reset();
     this.setButtonsForState();
     this.updateStatus();
     this.mirrorToStatusBar();
@@ -424,11 +456,20 @@ export class LiveRecordingModal extends Modal implements LiveSessionOwner {
       const text = await transcribe(pcm, modelDir);
       if (text) {
         this.producedText = true;
-        const content = await this.app.vault.read(note);
-        await this.app.vault.modify(
-          note,
-          appendToTranscriptSection(content, text),
-        );
+        const deduped = this.deduper.append(text);
+        const correction = this.deduper.takeCorrection();
+        if (deduped || correction) {
+          const content = await this.app.vault.read(note);
+          const corrected = correction
+            ? correctTranscriptWord(content, correction)
+            : content;
+          const updated = deduped
+            ? appendToTranscriptSection(corrected, deduped)
+            : corrected;
+          if (updated !== content) {
+            await this.app.vault.modify(note, updated);
+          }
+        }
       }
     } finally {
       this.transcribing = false;

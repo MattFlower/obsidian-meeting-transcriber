@@ -1,0 +1,9 @@
+# rust
+/target
+
+# sssf runtime
+adws/adw_data/sessions/
+adws/adw_data/sssf.db*
+.env
+__pycache__/
+*.pyc

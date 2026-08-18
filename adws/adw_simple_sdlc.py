@@ -2,13 +2,13 @@
 # /// script
 # dependencies = ["pydantic", "python-dotenv", "pyyaml", "rich"]
 # ///
-"""ADW Simple SDLC — plan, build, test, review, document, committing as it goes.
+"""ADW Simple SDLC — plan, build, verify, review, document, committing as it goes.
 
 Usage:
     uv run adws/adw_simple_sdlc.py "<prompt or path/to/prompt.md>" [--config adws/adw_sssf_config/sssf.config.yaml] [--adw-id a1b2c3d4]
 
 Phases: engineer(request) -> planner -> git(commit_plan)
-        -> builder -> code(test) [-> builder(fix) -> code(test) ... bounded]
+        -> builder -> code(verify) [-> builder(fix) -> code(verify) ... bounded]
         -> reviewer [-> builder(revise) -> reviewer ... bounded]
         -> code(retest, only if a revision changed code)
         -> git(commit_build) -> code(changes) -> documenter -> git(commit_docs)
@@ -19,10 +19,16 @@ the agent that produced it — `commit_message` on PlanOutput describes the spec
 on BuildOutput the code, on DocumentOutput the write-up. No agent's sentence is
 ever reused for another agent's diff.
 
-Testing is CODE, not an agent. `bun test` is a command, not a judgement call:
-an agent rediscovering it every run costs a million tokens to learn what a
-subprocess already knows. Failures travel back to the builder as an envelope,
-so the repair loop is unchanged — only the runner became free and repeatable.
+Verification is CODE, not an agent. The suite, the typecheck, and the bundle are
+commands, not judgement calls: an agent rediscovering them every run costs a
+million tokens to learn what a subprocess already knows. Failures travel back to
+the builder as an envelope, so the repair loop is unchanged — only the runner
+became free and repeatable.
+
+It runs the FULL quality set, not the suite alone. A green suite says the code
+runs; it says nothing about whether the project still typechecks or still
+bundles — and for a plugin the host loads as a bundle, a broken build is the
+failure that makes every other green light moot.
 
 Two different questions still get asked, in order. The suite asks "does it
 run"; the reviewer asks "is this what was asked for", against `plan.md` — and
@@ -93,22 +99,22 @@ def main(prompt: str, config: str = "adws/adw_sssf_config/sssf.config.yaml", adw
         build = ph.call(AgentCall(output_type=BuildOutput, prompt=prompt, previous=plan,
                                   gates=[gates.diff_matches_claims]))
 
-    test = None
+    quality_result = None
     for i in range(1, MAX_FIX_LOOPS + 1):
-        with run.phase(PhaseParams(name=f"test_{i}", kind="code", owner="quality",
-                                   description="Run the suite — a known command, so code runs "
-                                               "it and no agent has to rediscover it")) as ph:
-            test = quality.run_tests(run)
-            record(ph, test)
+        with run.phase(PhaseParams(name=f"verify_{i}", kind="code", owner="quality",
+                                   description="Run the suite, the typecheck, and the bundle — "
+                                               "known commands, so code runs them")) as ph:
+            quality_result = quality.run_quality(run)
+            record(ph, quality_result)
 
-        if test.passed:
+        if quality_result.passed:
             break
 
         with run.phase(PhaseParams(name=f"fix_{i}", kind="agent", owner="builder", retries=1,
-                                   description="Repair what the suite reported, from its "
+                                   description="Repair what the checks reported, from their "
                                                "verbatim output")) as ph:
             build = ph.call(AgentCall(output_type=BuildOutput, prompt=prompt,
-                                      previous=quality.as_envelope(test, "tests"),
+                                      previous=quality.as_envelope(quality_result, "quality"),
                                       gates=[gates.diff_matches_claims]))
 
     review = None
@@ -131,16 +137,16 @@ def main(prompt: str, config: str = "adws/adw_sssf_config/sssf.config.yaml", adw
     # A revision edited code after the suite last ran, so the green light is
     # stale. Re-run it rather than commit on a result that predates the change.
     if revised and review is not None and review.approved:
-        with run.phase(PhaseParams(name="retest", kind="code", owner="quality",
-                                   description="Re-run the suite — the revision changed code "
+        with run.phase(PhaseParams(name="reverify", kind="code", owner="quality",
+                                   description="Re-run every check — the revision changed code "
                                                "after the last green result")) as ph:
-            test = quality.run_tests(run)
-            record(ph, test)
+            quality_result = quality.run_quality(run)
+            record(ph, quality_result)
 
     # Red tests or a rejected review stop the chain here: the code stays
     # uncommitted and nothing is documented, because there is nothing worth
     # describing yet. The plan commit stands — it is a record of what was asked.
-    verified = (test is not None and test.passed
+    verified = (quality_result is not None and quality_result.passed
                 and review is not None and review.approved)
     if verified:
         with run.phase(PhaseParams(name="commit_build", kind="code", owner="git",
@@ -171,7 +177,7 @@ def main(prompt: str, config: str = "adws/adw_sssf_config/sssf.config.yaml", adw
             commit(ph, document)
 
     return run.finish(accepted=verified,
-                      reason="the suite or the review never came back clean")
+                      reason="the checks or the review never came back clean")
 
 
 if __name__ == "__main__":

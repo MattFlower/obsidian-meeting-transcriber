@@ -17,3 +17,6 @@ adws/adw_data/sssf.db*
 .env
 __pycache__/
 *.pyc
+
+# local install helper (machine-specific vault path)
+install.sh

@@ -54,7 +54,7 @@ def main(prompt: str, config: str = "adws/adw_sssf_config/sssf.config.yaml", adw
     quality_result = None
     for i in range(1, MAX_FIX_LOOPS + 1):
         with run.phase(PhaseParams(name=f"verify_{i}", kind="code", owner="quality",
-                                   description="Lint, typecheck, and build before testing")) as ph:
+                                   description="Run npm test, tsc --noEmit, and the plugin bundle in one pass")) as ph:
             quality_result = quality.run_quality(run)
             record(ph, quality_result)
 

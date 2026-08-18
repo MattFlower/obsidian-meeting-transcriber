@@ -1,31 +1,45 @@
-"""Deterministic lint, typecheck, build, and test blocks.
+"""Deterministic test, typecheck, and build blocks.
 
 A known command is not a judgement call. Anything whose invocation you can write
 down belongs here as code — it runs in milliseconds, costs nothing, and returns
 the same answer every time. Agents are for the parts that need reading and
 deciding.
 
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  REPLACE THE PLACEHOLDER COMMANDS BELOW.                                     ║
-║                                                                              ║
-║  Every block ships as an `echo` that exits 0 and announces it is fake. They   ║
-║  are placeholders on purpose: a stamped repo has no way to guess your test    ║
-║  runner, and a wrong-but-plausible command that silently passes is worse      ║
-║  than one that says so out loud.                                             ║
-║                                                                              ║
-║  For each block you want: swap `_placeholder(...)` for the real argv, e.g.    ║
-║      argv=["bun", "test", "apps/web/server.test.ts"]                         ║
-║      argv=["uv", "run", "pytest", "-q"]                                      ║
-║      argv=["npm", "run", "lint"]                                             ║
-║  Delete the blocks you don't need, and drop them from run_quality()'s list.   ║
-║                                                                              ║
-║  Two rules when you write the real command:                                  ║
-║    1. argv LIST, never a shell string — no quoting bugs, no shell injection.  ║
-║    2. Call binaries by BARE NAME. These blocks inherit the operator's         ║
-║       environment (see utils.operator_env), so `bun`, `uv`, `pytest` resolve  ║
-║       exactly as they do in their terminal. Never hard-code an absolute path  ║
-║       like /Users/you/.bun/bin/bun — that bakes your machine into the trace.  ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+Wired for the TYPESCRIPT toolchain — the deliverable is an Obsidian plugin
+(manifest.json + a bundled main.js, loaded by Electron). Three blocks:
+`npm test`, `npx tsc --noEmit`, and `npm run build`.
+
+Two deliberate choices:
+
+`npx tsc --noEmit` is the typecheck rather than a bundler flag because it needs
+nothing but a tsconfig.json — it is the one check that works before the build
+script exists, and it is the only one that reads every file rather than just
+those the bundler happens to reach from the entry point.
+
+There is no lint block. The scaffold does not exist yet, so any `npm run lint`
+would be a guess at a script name, and a block that fails because a script is
+missing reports a tooling gap as a code defect. Add one once the project has a
+linter — that is a real signal, where this would have been noise.
+
+These blocks run against package.json scripts, so they follow whatever the
+project settles on; `npm` is used as the invoker because it is present and
+reads the same `scripts` block every JS toolchain writes.
+
+Every npm block passes `--prefix <repo_root>`. Without it npm walks UP from the
+cwd looking for a package.json and will happily run a script from a parent
+directory — observed here reaching `/Users/mflower/package.json` before this
+project had a package.json of its own. A quality block that reports on someone
+else's project is worse than one that fails.
+
+Two rules when you edit a command here:
+  1. argv LIST, never a shell string — no quoting bugs, no shell injection.
+  2. Call binaries by BARE NAME. These blocks inherit the operator's
+     environment (see utils.operator_env), so `npm` and `npx` resolve exactly
+     as they do in their terminal. Never hard-code an absolute path like
+     /Users/you/.nvm/versions/node/bin/npm — that bakes your machine into the
+     trace.
+
+Delete a block you don't want, and drop it from run_quality()'s list too.
 """
 
 from __future__ import annotations
@@ -46,10 +60,10 @@ from .utils import now_iso, operator_env
 TAIL_CHARS = 4_000
 
 
-def _placeholder(name: str) -> list[str]:
-    """A command that does nothing and admits it. Replace every call to this."""
-    return ["echo", f"PLACEHOLDER {name}: edit adws/adw_modules/quality.py and "
-                    f"replace this echo with the real {name} command"]
+# A cold node_modules turns any of these into an install first, and tsc over a
+# fresh dependency graph is not fast. 120s (the QualityCheckSpec default) is too
+# tight to distinguish "slow" from "wedged" on a first run.
+BUILD_TIMEOUT = 600
 
 
 def _check_dir(run, name: str) -> Path:
@@ -133,44 +147,51 @@ def _run(spec: QualityCheckSpec, run) -> QualityCheckResult:
 
 
 # ── Blocks ────────────────────────────────────────────────────────────────────
-# Replace every argv below. See the banner at the top of this file.
 
 def test(run) -> QualityCheckResult:
-    """Run the project's test suite. The highest-value block to wire up first."""
+    """`npm test` — whatever the project's test script runs.
+
+    npm exits non-zero when the script is missing, so a project that never wired
+    a test script fails here rather than passing silently. That is the intended
+    reading: an unverified plugin is not a passing one.
+    """
     return _run(QualityCheckSpec(
         name="test",
-        area="backend",
+        area="frontend",
         operation="build",
-        argv=_placeholder("test"),        # e.g. ["bun", "test"] or ["uv", "run", "pytest", "-q"]
-        timeout_seconds=600,
-    ), run)
-
-
-def lint(run) -> QualityCheckResult:
-    return _run(QualityCheckSpec(
-        name="lint",
-        area="backend",
-        operation="lint",
-        argv=_placeholder("lint"),        # e.g. ["bun", "x", "oxlint@1.36.0", "src"]
+        argv=["npm", "--prefix", str(run.repo_root), "test"],
+        timeout_seconds=BUILD_TIMEOUT,
     ), run)
 
 
 def typecheck(run) -> QualityCheckResult:
+    """`tsc --noEmit` — type errors only, no output written.
+
+    --noEmit matters beyond speed: a typecheck that emitted files would leave
+    build output no agent claimed, which permissions.py would then roll back.
+    """
     return _run(QualityCheckSpec(
         name="typecheck",
-        area="backend",
+        area="frontend",
         operation="typecheck",
-        argv=_placeholder("typecheck"),   # e.g. ["bun", "x", "tsc", "--noEmit"]
+        argv=["npx", "tsc", "--noEmit"],
+        timeout_seconds=BUILD_TIMEOUT,
     ), run)
 
 
 def build(run) -> QualityCheckResult:
-    output_dir = _check_dir(run, "build") / "bundle"
+    """`npm run build` — bundle the plugin the way Obsidian will load it.
+
+    Typechecking clean and bundling clean are different claims: the bundler
+    resolves every import and asset for real, which is where a plugin that
+    compiles but cannot load shows itself.
+    """
     return _run(QualityCheckSpec(
         name="build",
-        area="backend",
+        area="frontend",
         operation="build",
-        argv=_placeholder("build"),       # e.g. ["bun", "build", "src/index.ts", "--outdir", str(output_dir)]
+        argv=["npm", "--prefix", str(run.repo_root), "run", "build"],
+        timeout_seconds=BUILD_TIMEOUT,
     ), run)
 
 
@@ -220,7 +241,6 @@ def run_quality(run) -> QualityResult:
     """
     blocks: list[Callable] = [
         test,
-        lint,
         typecheck,
         build,
     ]

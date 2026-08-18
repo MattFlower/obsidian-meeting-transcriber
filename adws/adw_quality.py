@@ -2,7 +2,7 @@
 # /// script
 # dependencies = ["pydantic", "python-dotenv", "pyyaml", "rich"]
 # ///
-"""ADW Quality — lint, typecheck, and build the project.
+"""ADW Quality — test, typecheck, and build the project.
 
 Usage:
     uv run adws/adw_quality.py "<reason for the quality run>" [--config adws/adw_sssf_config/sssf.config.yaml] [--adw-id a1b2c3d4]

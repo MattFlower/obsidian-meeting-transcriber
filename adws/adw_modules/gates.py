@@ -58,13 +58,44 @@ def json_parses(envelope: EnvelopeBase, run) -> GateReport:
     return report
 
 
+def _deleted_paths(run) -> set[str]:
+    """Paths git records as removed, in the working tree or the index."""
+    try:
+        out = subprocess.run(["git", "status", "--porcelain"], cwd=run.repo_root,
+                             capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return set()
+    deleted = set()
+    for line in out.splitlines():
+        if len(line) > 3 and "D" in line[:2]:          # ' D', 'D ', or 'AD'
+            deleted.add(line[3:].strip().strip('"'))
+    return deleted
+
+
 def diff_matches_claims(envelope: EnvelopeBase, run) -> GateReport:
-    """Every file claimed changed must exist on disk."""
+    """Every file claimed changed must exist, or be a removal git can confirm.
+
+    Existence alone is the wrong test, because DELETING a file is a change. An
+    agent that replaces a module — removing the old one and writing a new one —
+    reports both in `changed_files` honestly, and a gate that can only `stat`
+    calls the honest half a lie. Observed: a builder swapped live-modal.ts for
+    live-panel.ts and was failed for the deletion it correctly declared.
+
+    So a claim is verified when the file is on disk OR git records its removal.
+    Only a path that is neither — no file, no deletion — is a fabricated claim,
+    which is the thing this gate exists to catch.
+    """
     report = GateReport()
+    deleted = _deleted_paths(run)
     for f in getattr(envelope, "changed_files", []):
         p = Path(f)
-        report.check(f, p.exists(),
-                     f"exists, {_size(p)}" if p.exists() else "claimed changed file does not exist")
+        if p.exists():
+            report.check(f, True, f"exists, {_size(p)}")
+        elif f in deleted:
+            report.check(f, True, "deleted, and git records the removal")
+        else:
+            report.check(f, False, "claimed changed file does not exist and git "
+                                   "records no deletion of it")
     return report
 
 

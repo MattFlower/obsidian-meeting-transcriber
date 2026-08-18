@@ -1,0 +1,33 @@
+{
+  "name": "obsidian-meeting-transcriber",
+  "version": "0.1.0",
+  "description": "Transcribe meeting audio files in the vault with Parakeet (local ONNX via sherpa-onnx-node) and summarize/tag the resulting notes with an LLM.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "package": "npm run build && node package.mjs",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "transcription",
+    "parakeet",
+    "sherpa-onnx",
+    "meeting"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "sherpa-onnx-node": "^1.13.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.5",
+    "obsidian": "^1.7.2",
+    "tslib": "^2.6.2",
+    "typescript": "^5.5.4",
+    "vitest": "^2.1.9"
+  }
+}

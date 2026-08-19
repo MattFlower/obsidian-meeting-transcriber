@@ -1,10 +1,76 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   MODEL_FILE_NAMES,
   buildRecognizerConfig,
+  loadSherpaOnnx,
   missingModelFiles,
   modelFilePaths,
+  transcribe,
 } from "../src/transcriber";
+
+describe("plugin-directory module resolution", () => {
+  let pluginDir: string;
+
+  beforeAll(() => {
+    pluginDir = mkdtempSync(path.join(tmpdir(), "plugin-dir-"));
+    writeFileSync(path.join(pluginDir, "package.json"), "{}");
+
+    const moduleDir = path.join(
+      pluginDir,
+      "node_modules",
+      "sherpa-onnx-node",
+    );
+    mkdirSync(moduleDir, { recursive: true });
+    writeFileSync(
+      path.join(moduleDir, "package.json"),
+      JSON.stringify({ main: "index.js" }),
+    );
+    writeFileSync(
+      path.join(moduleDir, "index.js"),
+      `let lastConfig;
+class OfflineRecognizer {
+  constructor(config) { lastConfig = config; }
+  createStream() {
+    return { acceptWaveform() {} };
+  }
+  decode() {}
+  getResult() { return { text: "  hello world  " }; }
+  dispose() {}
+}
+module.exports = {
+  __fake: true,
+  OfflineRecognizer,
+  getLastConfig: () => lastConfig,
+};
+`,
+    );
+  });
+
+  afterAll(() => {
+    rmSync(pluginDir, { recursive: true, force: true });
+  });
+
+  it("loads sherpa-onnx-node from the installed plugin directory", () => {
+    expect(loadSherpaOnnx(pluginDir).__fake).toBe(true);
+  });
+
+  it("uses the anchored module through the recognizer path", async () => {
+    const text = await transcribe(
+      new Float32Array(16000),
+      "models/parakeet",
+      pluginDir,
+    );
+
+    expect(text).toBe("hello world");
+    const sherpa = loadSherpaOnnx(pluginDir);
+    expect(sherpa.getLastConfig().modelConfig.transducer.encoder).toBe(
+      "models/parakeet/encoder.int8.onnx",
+    );
+  });
+});
 
 describe("modelFilePaths", () => {
   it("points at the four expected Parakeet files", () => {

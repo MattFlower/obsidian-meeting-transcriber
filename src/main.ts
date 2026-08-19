@@ -157,7 +157,8 @@ export default class MeetingTranscriberPlugin extends Plugin {
 
   private async transcribeFile(file: TFile): Promise<void> {
     const modelDirAbs = this.resolveModelDir();
-    if (!modelDirAbs) {
+    const pluginDir = this.resolvePluginDir();
+    if (!modelDirAbs || !pluginDir) {
       new Notice(
         "Transcription requires the desktop file-system adapter.",
         10000,
@@ -204,7 +205,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     this.setStatus("Transcribing (this can take a while)…");
     const progress = new Notice("Transcribing… this can take a few minutes.");
     try {
-      const text = await transcribe(samples, modelDirAbs);
+      const text = await transcribe(samples, modelDirAbs, pluginDir);
       if (!text) {
         new Notice("Transcription produced no text.", 10000);
         return;
@@ -233,6 +234,19 @@ export default class MeetingTranscriberPlugin extends Plugin {
     const adapter = this.app.vault.adapter;
     if (!(adapter instanceof FileSystemAdapter)) return null;
     const dir = path.join(adapter.getBasePath(), this.settings.modelDir);
+    return dir.split(path.sep).join("/");
+  }
+
+  /**
+   * Absolute path of the installed plugin folder. Used as the createRequire
+   * anchor so native dependencies resolve from this plugin's node_modules.
+   * Returns null for non-desktop vault adapters.
+   */
+  resolvePluginDir(): string | null {
+    const adapter = this.app.vault.adapter;
+    const manifestDir = this.manifest.dir;
+    if (!(adapter instanceof FileSystemAdapter) || !manifestDir) return null;
+    const dir = path.join(adapter.getBasePath(), manifestDir);
     return dir.split(path.sep).join("/");
   }
 

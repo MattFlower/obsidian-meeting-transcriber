@@ -1,3 +1,5 @@
+import { createRequire } from "node:module";
+
 /**
  * Offline recognizer config for the NeMo Parakeet TDT 0.6B v2 (int8) model.
  *
@@ -89,23 +91,35 @@ export function missingModelFiles(
 }
 
 /**
+ * Load sherpa-onnx-node relative to the installed plugin directory. Obsidian
+ * evaluates plugin code without a module directory context, so anchoring a
+ * require at the plugin package makes Node find the plugin's node_modules.
+ * Kept lazy so importing this module never loads the native addon.
+ */
+export function loadSherpaOnnx(pluginDir: string): any {
+  const dir = pluginDir.replace(/\/+$/, "");
+  const pluginRequire = createRequire(`${dir}/package.json`);
+  return pluginRequire("sherpa-onnx-node");
+}
+
+/**
  * Transcribe 16 kHz mono PCM samples into text using the Parakeet model in
  * `modelDir`.
  *
- * The native addon is required lazily (and is an esbuild external) so that
- * importing this module never loads the native binary — important for the
- * headless vitest runs. If the host's Electron/Node ABI rejects the
- * prebuilt addon, a fallback is to spawn `process.execPath` with
- * ELECTRON_RUN_AS_NODE=1 and a small helper script that performs this same
- * decode; see the README.
+ * The native addon is loaded lazily via a require anchored at `pluginDir`
+ * (and remains an esbuild external), so importing this module never loads the
+ * native binary — important for headless vitest runs. If the host's
+ * Electron/Node ABI rejects the prebuilt addon, a fallback is to spawn
+ * `process.execPath` with ELECTRON_RUN_AS_NODE=1 and a small helper script
+ * that performs this same decode; see the README.
  */
 export async function transcribe(
   pcm: Float32Array,
   modelDir: string,
+  pluginDir: string,
   sampleRate = 16000,
 ): Promise<string> {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const sherpa = require("sherpa-onnx-node");
+  const sherpa = loadSherpaOnnx(pluginDir);
   const recognizer = new sherpa.OfflineRecognizer(
     buildRecognizerConfig(modelDir),
   );

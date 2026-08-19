@@ -20,6 +20,7 @@ import type { TranscriberSettings } from "./settings";
 export interface LiveRecordingHost {
   settings: TranscriberSettings;
   resolveModelDir(): string | null;
+  resolvePluginDir(): string | null;
   findMissingModelFiles(): string[];
   createNote(
     baseName: string,
@@ -465,13 +466,14 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
 
   private async transcribeChunk(pcm: Float32Array): Promise<void> {
     const modelDir = this.host.resolveModelDir();
+    const pluginDir = this.host.resolvePluginDir();
     const note = this.note;
-    if (!modelDir || !note) return;
+    if (!modelDir || !pluginDir || !note) return;
     this.transcribing = true;
     this.updateStatus();
     this.host.setStatus("● Live: transcribing chunk…");
     try {
-      const text = await transcribe(pcm, modelDir);
+      const text = await transcribe(pcm, modelDir, pluginDir);
       if (text) {
         this.producedText = true;
         const deduped = this.deduper.append(text);

@@ -175,6 +175,28 @@ describe("splitFrontmatter / applySummaryToBody", () => {
     expect(out).toContain("x");
   });
 
+  it("places Summary as the first section, after the H1 and before Transcript", () => {
+    const md =
+      "---\n" +
+      "tags: [meeting]\n" +
+      'description: ""\n' +
+      "---\n\n" +
+      "# 2026-08-24 planning\n\n" +
+      "## Transcript\n\nAlice: hi\n\n" +
+      "## Action items\n\n- do thing\n";
+    const out = applySummaryToBody(md, "The recap.");
+    const firstSection = out.split("\n").find((l) => l.startsWith("## "));
+    expect(firstSection).toBe("## Summary");
+    const titleIdx = out.indexOf("# 2026-08-24 planning");
+    const summaryIdx = out.indexOf("## Summary");
+    const transcriptIdx = out.indexOf("## Transcript");
+    expect(titleIdx).toBeLessThan(summaryIdx);
+    expect(summaryIdx).toBeLessThan(transcriptIdx);
+    expect(out).toContain("The recap.");
+    // the existing trailing section is preserved
+    expect(out).toContain("## Action items");
+  });
+
   it("splitFrontmatter returns empty prefix when there is no frontmatter", () => {
     const { prefix, body } = splitFrontmatter("# T\n\nbody");
     expect(prefix).toBe("");
@@ -211,10 +233,19 @@ describe("mergeSummaryIntoFrontmatter", () => {
 });
 
 describe("insertSummarySection", () => {
-  it("appends at the end when no Transcript heading exists", () => {
+  it("inserts at the top after the H1 when no Transcript heading exists", () => {
     const out = insertSummarySection("# T\n\nbody", "S");
-    expect(out).toContain("## Summary");
-    expect(out.trimEnd().endsWith("S")).toBe(true);
+    const firstSection = out.split("\n").find((l) => l.startsWith("## "));
+    expect(firstSection).toBe("## Summary");
+    expect(out).toContain("S");
+    expect(out).toContain("body");
+  });
+
+  it("inserts at the very start when there is no H1", () => {
+    const out = insertSummarySection("## Transcript\n\nx\n", "S");
+    const firstSection = out.split("\n").find((l) => l.startsWith("## "));
+    expect(firstSection).toBe("## Summary");
+    expect(out).toContain("x");
   });
 });
 

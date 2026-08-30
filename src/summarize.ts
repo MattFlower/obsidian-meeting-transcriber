@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
@@ -148,4 +150,176 @@ export async function callChatCompletion(
     throw new Error("LLM response had no message content.");
   }
   return content;
+}
+
+/**
+ * Build a single-string prompt for backends with no system/user message split
+ * (e.g. a CLI): the same strict-JSON instructions as buildSummarizePrompt,
+ * followed by the transcript. Pure so it can be tested.
+ */
+export function buildCliPrompt(transcript: string): string {
+  const [system, user] = buildSummarizePrompt(transcript);
+  return `${system.content}\n\n${user.content}`;
+}
+
+/**
+ * Minimal structural shape of the child process used by runCliPrompt, so
+ * tests can inject a fake without the real node:child_process instance.
+ */
+export interface CliChildProcess {
+  stdout: CliChildStream | null;
+  stderr: CliChildStream | null;
+  write(data: string): void | boolean;
+  on(event: string, listener: (...args: any[]) => void): unknown;
+  kill(signal?: NodeJS.Signals): boolean;
+}
+
+export interface CliChildStream {
+  on(event: "data", listener: (chunk: string) => void): unknown;
+}
+
+export type SpawnImpl = (file: string, args: string[]) => CliChildProcess;
+
+/** How long a CLI summarizer may run before it is killed (3 minutes). */
+export const CLI_TIMEOUT_MS = 3 * 60 * 1000;
+
+/**
+ * Run a local CLI summarizer: split `command` on whitespace into argv (no
+ * shell, so no injection), write `prompt` to stdin, and resolve with the
+ * trimmed stdout on exit code 0. Rejects with a useful Error on a non-zero
+ * exit (stderr tail included), on ENOENT ("command not found"), or after a
+ * 3-minute timeout (the child is killed). `spawnImpl` is injectable for
+ * tests.
+ */
+export async function runCliPrompt(
+  command: string,
+  prompt: string,
+  spawnImpl?: SpawnImpl,
+): Promise<string> {
+  const argv = command.trim().split(/\s+/);
+  if (argv.length === 0 || !argv[0]) {
+    throw new Error("CLI command is empty; set it in the plugin settings.");
+  }
+  const doSpawn: SpawnImpl =
+    spawnImpl ??
+    ((file, args) => spawn(file, args) as unknown as CliChildProcess);
+  const child = doSpawn(argv[0], argv.slice(1));
+
+  return new Promise<string>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const settle = (action: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      action();
+    };
+    const timer = setTimeout(() => {
+      child.kill();
+      settle(() =>
+        reject(new Error(`CLI command timed out after 3 minutes: ${command}`)),
+      );
+    }, CLI_TIMEOUT_MS);
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") {
+        settle(
+          () =>
+            reject(
+              new Error(
+                `command not found: \`${argv[0]}\` — install it or change ` +
+                  "the CLI command in settings",
+              ),
+            ),
+        );
+      } else {
+        settle(() => reject(err));
+      }
+    });
+    child.on("close", (code: number) => {
+      if (code === 0) {
+        settle(() => resolve(stdout.trim()));
+      } else {
+        const tail = stderr
+          .trim()
+          .split("\n")
+          .slice(-5)
+          .join(" | ");
+        const suffix = tail ? `: ${tail}` : "";
+        settle(() =>
+          reject(new Error(`CLI command exited with code ${code}${suffix}`)),
+        );
+      }
+    });
+
+    child.write(prompt);
+  });
+}
+
+/**
+ * The summarizer-relevant subset of plugin settings (structurally satisfied
+ * by TranscriberSettings).
+ */
+export interface SummarizerSettings {
+  summarizerBackend: "cloud" | "local" | "cli";
+  llmBaseUrl: string;
+  llmApiKey: string;
+  llmModel: string;
+  localBaseUrl: string;
+  localModel: string;
+  cliCommand: string;
+}
+
+/** Injectable dependencies for summarizeTranscript (tests). */
+export interface SummarizerDeps {
+  fetchImpl?: typeof fetch;
+  spawnImpl?: SpawnImpl;
+}
+
+/**
+ * Summarize a transcript using the backend chosen in settings:
+ *  - "cloud" → the user's OpenAI-compatible HTTP API with their API key
+ *  - "local" → an OpenAI-compatible HTTP server on this machine (no key)
+ *  - "cli"   → a local CLI subprocess using its own login (no key stored)
+ * Returns the parsed SummaryResult.
+ */
+export async function summarizeTranscript(
+  settings: SummarizerSettings,
+  transcript: string,
+  deps?: SummarizerDeps,
+): Promise<SummaryResult> {
+  let raw: string;
+  if (settings.summarizerBackend === "cli") {
+    raw = await runCliPrompt(
+      settings.cliCommand,
+      buildCliPrompt(transcript),
+      deps?.spawnImpl,
+    );
+  } else {
+    const llm =
+      settings.summarizerBackend === "local"
+        ? {
+            llmBaseUrl: settings.localBaseUrl,
+            llmApiKey: "",
+            llmModel: settings.localModel,
+          }
+        : {
+            llmBaseUrl: settings.llmBaseUrl,
+            llmApiKey: settings.llmApiKey,
+            llmModel: settings.llmModel,
+          };
+    raw = await callChatCompletion(
+      llm,
+      buildSummarizePrompt(transcript),
+      deps?.fetchImpl,
+    );
+  }
+  return parseSummaryResponse(raw);
 }

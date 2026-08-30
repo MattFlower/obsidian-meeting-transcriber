@@ -154,9 +154,10 @@ export interface SummaryPatch {
 
 /**
  * Insert a `## Summary` section into a note body, replacing an existing one
- * if present. When there is no existing summary, it is inserted before
- * `## Transcript` (or appended at the end if that heading is absent).
- * Pure so it can be tested.
+ * if present. When there is no existing summary, it is inserted at the top
+ * of the body — after the leading `# ` H1 line (and its following blank
+ * line) when one is present, otherwise at the very start — so the summary is
+ * always the first section of the note. Pure so it can be tested.
  */
 export function insertSummarySection(body: string, summary: string): string {
   const lines = body.split("\n");
@@ -183,20 +184,15 @@ export function insertSummarySection(body: string, summary: string): string {
     return [...before, section, "", ...after].join("\n");
   }
 
-  let transcriptIdx = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^##\s+Transcript\s*$/i.test(lines[i])) {
-      transcriptIdx = i;
-      break;
-    }
+  // No existing Summary: put it at the top of the body, after the leading
+  // `# ` H1 line (and its blank line) when present, else at the very start.
+  let insertAt = 0;
+  if (/^#\s+/.test(lines[0] ?? "")) {
+    insertAt = lines.length > 1 && lines[1].trim() === "" ? 2 : 1;
   }
-  if (transcriptIdx !== -1) {
-    const before = lines.slice(0, transcriptIdx);
-    const after = lines.slice(transcriptIdx);
-    return [...before, section, "", ...after].join("\n");
-  }
-
-  return `${body.trimEnd()}\n\n${section}\n`;
+  const before = lines.slice(0, insertAt);
+  const after = lines.slice(insertAt);
+  return [...before, section, "", ...after].join("\n");
 }
 
 /**

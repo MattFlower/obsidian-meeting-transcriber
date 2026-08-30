@@ -2,7 +2,7 @@
 # v1 runs the Pi coding agent only; coding_agent: claude_code arrives in v2.
 defaults:
   coding_agent: pi
-  model: unsloth/Qwen3.8-27B-GGUF # provider/id — a bare pattern is ambiguous across providers
+  model: mtplx/mtplx-qwen38-27b-optimized-quality
   thinking: medium # off | minimal | low | medium | high | xhigh | max
   harness_engineering: [] # pi extensions loaded into the harness (-e)
   # Roster-wide allowlist; any agent may override with its own list.

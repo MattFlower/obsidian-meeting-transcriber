@@ -17,11 +17,7 @@ import {
 import { decodeToMono16k, isAudioFile } from "./audio";
 import { modelFilePaths, transcribe } from "./transcriber";
 import { downloadModel } from "./model-download";
-import {
-  buildSummarizePrompt,
-  callChatCompletion,
-  parseSummaryResponse,
-} from "./summarize";
+import { summarizeTranscript } from "./summarize";
 import {
   applySummaryToBody,
   mergeSummaryIntoFrontmatter,
@@ -42,9 +38,11 @@ import { LiveSessionRegistry } from "./live";
  * - Records a live meeting (microphone or system audio) and appends the
  *   transcript to a note in ~15 s chunks as the meeting is spoken, with
  *   pause/resume support.
- * - Summarizes a transcription note with an OpenAI-compatible LLM, adding
- *   tags + a description to the frontmatter and a `## Summary` section so the
- *   note is easier to search later.
+ * - Summarizes a transcription note with a user-selected backend — a cloud
+ *   LLM over its HTTP API (with the user's key), a local LLM server on the
+ *   machine, or a local CLI (claude -p / codex exec) using its own login —
+ *   adding tags + a description to the frontmatter and a `## Summary`
+ *   section at the top of the note so it is easier to search later.
  *
  * Desktop only: the ASR engine is a native Node addon and audio decoding uses
  * the Web Audio API.
@@ -362,13 +360,28 @@ export default class MeetingTranscriberPlugin extends Plugin {
   }
 
   private async summarizeFile(file: TFile): Promise<void> {
+    const s = this.settings;
+    if (s.summarizerBackend === "cloud" && !s.llmApiKey) {
+      new Notice(
+        "Set the cloud LLM API key in settings, or switch the summarization " +
+          "backend.",
+        15000,
+      );
+      return;
+    }
     if (
-      !this.settings.llmApiKey &&
-      !isLocalBaseUrl(this.settings.llmBaseUrl)
+      s.summarizerBackend === "local" &&
+      (!s.localBaseUrl || !s.localModel)
     ) {
       new Notice(
-        "Set an LLM API key in the Meeting Transcriber settings first " +
-          "(or point the base URL at a local server).",
+        "Set the local LLM base URL and model in settings first.",
+        15000,
+      );
+      return;
+    }
+    if (s.summarizerBackend === "cli" && !s.cliCommand) {
+      new Notice(
+        "Set the CLI command (e.g. `claude -p`) in settings first.",
         15000,
       );
       return;
@@ -379,9 +392,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     try {
       const content = await this.app.vault.read(file);
       const transcript = extractTranscript(content) || content;
-      const messages = buildSummarizePrompt(transcript);
-      const raw = await callChatCompletion(this.settings, messages);
-      const result = parseSummaryResponse(raw);
+      const result = await summarizeTranscript(this.settings, transcript);
       // 1) Insert/replace the `## Summary` section in the body, preserving the
       //    existing frontmatter bytes verbatim.
       const updated = applySummaryToBody(content, result.summary);
@@ -401,21 +412,6 @@ export default class MeetingTranscriberPlugin extends Plugin {
       notice.hide();
       this.setStatus("");
     }
-  }
-}
-
-/** True when the base URL points at a local server (no API key needed). */
-function isLocalBaseUrl(baseUrl: string): boolean {
-  try {
-    const url = new URL(baseUrl);
-    return (
-      url.hostname === "localhost" ||
-      url.hostname === "127.0.0.1" ||
-      url.hostname === "0.0.0.0" ||
-      url.hostname.endsWith(".local")
-    );
-  } catch {
-    return false;
   }
 }
 

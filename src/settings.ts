@@ -2,6 +2,8 @@ import { App, PluginSettingTab, Setting } from "obsidian";
 import type MeetingTranscriberPlugin from "./main";
 import type { LiveAudioSource } from "./live";
 
+export type SummarizerBackend = "cloud" | "local" | "cli";
+
 export interface TranscriberSettings {
   /** Vault-relative directory holding the Parakeet ONNX model files. */
   modelDir: string;
@@ -13,6 +15,14 @@ export interface TranscriberSettings {
   llmApiKey: string;
   /** Model name passed to the LLM endpoint. */
   llmModel: string;
+  /** Which summarization backend the summarize command uses. */
+  summarizerBackend: SummarizerBackend;
+  /** Base URL of a local OpenAI-compatible LLM server (Ollama / LM Studio). */
+  localBaseUrl: string;
+  /** Model name passed to the local LLM server. */
+  localModel: string;
+  /** CLI that reads a prompt on stdin and prints the answer (e.g. "claude -p"). */
+  cliCommand: string;
   /** Tags added to every new transcription note. */
   defaultTags: string[];
   /** Pre-selected source for the live recording modal. */
@@ -27,6 +37,10 @@ export const DEFAULT_SETTINGS: TranscriberSettings = {
   llmBaseUrl: "https://api.openai.com/v1",
   llmApiKey: "",
   llmModel: "gpt-4o-mini",
+  summarizerBackend: "cloud",
+  localBaseUrl: "http://localhost:11434/v1",
+  localModel: "llama3.1",
+  cliCommand: "claude -p",
   defaultTags: ["meeting"],
   liveAudioSource: "microphone",
   liveChunkSeconds: 15,
@@ -74,46 +88,115 @@ export class TranscriberSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("LLM base URL")
+      .setName("Summarization backend")
       .setDesc(
-        "OpenAI-compatible API base URL, e.g. https://api.openai.com/v1 " +
-          "(also works with Ollama or LM Studio).",
+        "How the 'Summarize and tag this transcription' command generates " +
+          "summaries.",
       )
-      .addText((text) =>
-        text
-          .setPlaceholder("https://api.openai.com/v1")
-          .setValue(this.plugin.settings.llmBaseUrl)
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("cloud", "Cloud LLM (HTTP API + key)")
+          .addOption("local", "Local LLM (on this machine)")
+          .addOption("cli", "Local CLI (claude -p / codex exec)")
+          .setValue(this.plugin.settings.summarizerBackend)
           .onChange(async (value) => {
-            this.plugin.settings.llmBaseUrl = value.trim();
+            this.plugin.settings.summarizerBackend =
+              value as SummarizerBackend;
             await this.plugin.saveSettings();
+            this.display();
           }),
       );
 
-    new Setting(containerEl)
-      .setName("LLM API key")
-      .setDesc("Used as a Bearer token. Leave empty for local servers.")
-      .addText((text) =>
-        text
-          .setPlaceholder("sk-...")
-          .setValue(this.plugin.settings.llmApiKey)
-          .onChange(async (value) => {
-            this.plugin.settings.llmApiKey = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
+    if (this.plugin.settings.summarizerBackend === "cloud") {
+      new Setting(containerEl)
+        .setName("Cloud LLM base URL")
+        .setDesc(
+          "Cloud backend: OpenAI-compatible API base URL, e.g. " +
+            "https://api.openai.com/v1",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("https://api.openai.com/v1")
+            .setValue(this.plugin.settings.llmBaseUrl)
+            .onChange(async (value) => {
+              this.plugin.settings.llmBaseUrl = value.trim();
+              await this.plugin.saveSettings();
+            }),
+        );
 
-    new Setting(containerEl)
-      .setName("LLM model")
-      .setDesc("Model name sent to the endpoint, e.g. gpt-4o-mini.")
-      .addText((text) =>
-        text
-          .setPlaceholder("gpt-4o-mini")
-          .setValue(this.plugin.settings.llmModel)
-          .onChange(async (value) => {
-            this.plugin.settings.llmModel = value.trim() || "gpt-4o-mini";
-            await this.plugin.saveSettings();
-          }),
-      );
+      new Setting(containerEl)
+        .setName("Cloud LLM API key")
+        .setDesc("Cloud backend: used as a Bearer token.")
+        .addText((text) =>
+          text
+            .setPlaceholder("sk-...")
+            .setValue(this.plugin.settings.llmApiKey)
+            .onChange(async (value) => {
+              this.plugin.settings.llmApiKey = value.trim();
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("Cloud LLM model")
+        .setDesc("Cloud backend: model name sent to the endpoint, e.g. gpt-4o-mini.")
+        .addText((text) =>
+          text
+            .setPlaceholder("gpt-4o-mini")
+            .setValue(this.plugin.settings.llmModel)
+            .onChange(async (value) => {
+              this.plugin.settings.llmModel = value.trim() || "gpt-4o-mini";
+              await this.plugin.saveSettings();
+            }),
+        );
+    } else if (this.plugin.settings.summarizerBackend === "local") {
+      new Setting(containerEl)
+        .setName("Local LLM base URL")
+        .setDesc(
+          "Local backend: OpenAI-compatible server on this machine, e.g. " +
+            "Ollama http://localhost:11434/v1 or LM Studio " +
+            "http://localhost:1234/v1. No API key needed.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("http://localhost:11434/v1")
+            .setValue(this.plugin.settings.localBaseUrl)
+            .onChange(async (value) => {
+              this.plugin.settings.localBaseUrl = value.trim();
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("Local LLM model")
+        .setDesc("Local backend: model name sent to the local server, e.g. llama3.1.")
+        .addText((text) =>
+          text
+            .setPlaceholder("llama3.1")
+            .setValue(this.plugin.settings.localModel)
+            .onChange(async (value) => {
+              this.plugin.settings.localModel = value.trim() || "llama3.1";
+              await this.plugin.saveSettings();
+            }),
+        );
+    } else {
+      new Setting(containerEl)
+        .setName("CLI command")
+        .setDesc(
+          "CLI backend: command that reads a prompt on stdin and prints the " +
+            "answer, e.g. `claude -p` or `codex exec`. Uses the CLI's own " +
+            "login — no API key is stored by the plugin.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("claude -p")
+            .setValue(this.plugin.settings.cliCommand)
+            .onChange(async (value) => {
+              this.plugin.settings.cliCommand = value.trim() || "claude -p";
+              await this.plugin.saveSettings();
+            }),
+        );
+    }
 
     new Setting(containerEl)
       .setName("Default tags")

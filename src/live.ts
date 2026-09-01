@@ -1,13 +1,14 @@
 /**
  * Live meeting recording: capture microphone or system audio with the Web
- * Audio API, cut the PCM into fixed-length chunks, and hand each finished
- * chunk to a callback (the modal transcribes it with the existing offline
- * Parakeet recognizer and appends the text to the note).
+ * Audio API (an AudioWorklet on the audio rendering thread), cut the PCM
+ * into fixed-length chunks, and hand each finished chunk to a callback (the
+ * panel transcribes it with the shared offline Parakeet recognizer and
+ * appends the text to the note).
  *
  * This module is framework-free: Obsidian/DOM APIs are injected through
  * `LiveCaptureDeps` so the session logic stays unit-testable headlessly.
  * No native modules are imported here — `transcribe()` (which lazily
- * requires `sherpa-onnx-node`) lives in the modal's pump.
+ * requires `sherpa-onnx-node`) lives in the panel's pump.
  */
 
 export type LiveAudioSource = "microphone" | "system";
@@ -352,6 +353,63 @@ export class LiveChunker {
 }
 
 // ---------------------------------------------------------------------------
+// Capture worklet
+// ---------------------------------------------------------------------------
+
+/** Name the capture processor is registered under in the worklet scope. */
+export const CAPTURE_PROCESSOR_NAME = "meeting-transcriber-capture";
+
+/** Mono samples per frame posted from the worklet to the main thread. */
+export const CAPTURE_FRAME_SAMPLES = 4096;
+
+/**
+ * Source of the AudioWorklet module that captures the input. It runs on the
+ * audio rendering thread, so capture keeps up while the renderer thread is
+ * busy (Obsidian re-rendering the note after each append, for instance),
+ * unlike the deprecated ScriptProcessorNode whose callback shared the main
+ * thread. Each 128-sample render quantum is copied into a frame, and each
+ * full frame is posted to the main thread — transferred, not cloned — where
+ * the session feeds it to the chunker. Up to one partial frame (256 ms at
+ * 16 kHz) still in the worklet when the session stops is dropped, as with
+ * the previous ScriptProcessorNode buffer.
+ *
+ * It is a string because Obsidian plugins ship as a single bundled file with
+ * nothing to serve a worklet script from; the panel loads it via a blob: URL.
+ * Only ES2018 syntax is used so the worklet scope needs no transpiling.
+ */
+export const CAPTURE_WORKLET_SOURCE = `
+const FRAME_SAMPLES = ${CAPTURE_FRAME_SAMPLES};
+
+class CaptureProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.frame = new Float32Array(FRAME_SAMPLES);
+    this.filled = 0;
+  }
+
+  process(inputs) {
+    const channel = inputs[0] && inputs[0][0];
+    if (!channel) return true;
+    let offset = 0;
+    while (offset < channel.length) {
+      const n = Math.min(channel.length - offset, FRAME_SAMPLES - this.filled);
+      this.frame.set(channel.subarray(offset, offset + n), this.filled);
+      this.filled += n;
+      offset += n;
+      if (this.filled === FRAME_SAMPLES) {
+        this.port.postMessage(this.frame, [this.frame.buffer]);
+        this.frame = new Float32Array(FRAME_SAMPLES);
+        this.filled = 0;
+      }
+    }
+    return true;
+  }
+}
+
+registerProcessor(${JSON.stringify(CAPTURE_PROCESSOR_NAME)}, CaptureProcessor);
+`;
+
+// ---------------------------------------------------------------------------
 // Minimal structural interfaces for the Web Audio / MediaStream surface the
 // session touches. The real DOM types satisfy these structurally, and tests
 // can substitute fakes without a DOM.
@@ -374,23 +432,18 @@ export interface LiveAudioNodeLike {
   disconnect(): void;
 }
 
-export interface LiveAudioProcessEvent {
-  inputBuffer: {
-    getChannelData(channel: number): Float32Array;
-  };
+/** The capture node's message port; each frame arrives as `event.data`. */
+export interface LiveCapturePortLike {
+  onmessage: ((event: { data: unknown }) => void) | null;
+  close(): void;
 }
 
-export interface LiveScriptProcessorLike extends LiveAudioNodeLike {
-  onaudioprocess: ((event: LiveAudioProcessEvent) => void) | null;
+export interface LiveCaptureNodeLike extends LiveAudioNodeLike {
+  readonly port: LiveCapturePortLike;
 }
 
 export interface LiveAudioContextLike {
   createMediaStreamSource(stream: LiveMediaStreamLike): LiveAudioNodeLike;
-  createScriptProcessor(
-    bufferSize: number,
-    numInputChannels: number,
-    numOutputChannels: number,
-  ): LiveScriptProcessorLike;
   readonly destination: unknown;
   close(): Promise<void>;
 }
@@ -401,6 +454,17 @@ export interface LiveCaptureDeps {
   getDisplayMedia(constraints: MediaStreamConstraints): Promise<LiveMediaStreamLike>;
   enumerateDevices(): Promise<MediaDeviceInfo[]>;
   createAudioContext(sampleRate: number): LiveAudioContextLike;
+  /**
+   * Register the capture worklet module (`source`, which calls
+   * `registerProcessor(processorName, …)`) in `context` and return a node
+   * for it. The node's port posts one `Float32Array` of mono samples per
+   * captured frame.
+   */
+  createCaptureNode(
+    context: LiveAudioContextLike,
+    source: string,
+    processorName: string,
+  ): Promise<LiveCaptureNodeLike>;
 }
 
 export interface LiveRecordingSessionOptions {
@@ -437,7 +501,7 @@ export class LiveRecordingSession {
   private stream: LiveMediaStreamLike | null = null;
   private context: LiveAudioContextLike | null = null;
   private sourceNode: LiveAudioNodeLike | null = null;
-  private processor: LiveScriptProcessorLike | null = null;
+  private captureNode: LiveCaptureNodeLike | null = null;
   private recording = false;
   private paused = false;
   private startedAtMs = 0;
@@ -524,15 +588,29 @@ export class LiveRecordingSession {
     }
 
     const context = this.deps.createAudioContext(this.sampleRate);
-    const sourceNode = context.createMediaStreamSource(stream);
-    const processor = context.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      this.handleFrame(event.inputBuffer.getChannelData(0));
-    };
-    sourceNode.connect(processor);
-    // The processor must be connected to the destination for
-    // onaudioprocess to fire in Chromium.
-    processor.connect(context.destination);
+    let sourceNode: LiveAudioNodeLike;
+    let captureNode: LiveCaptureNodeLike;
+    try {
+      captureNode = await this.deps.createCaptureNode(
+        context,
+        CAPTURE_WORKLET_SOURCE,
+        CAPTURE_PROCESSOR_NAME,
+      );
+      captureNode.port.onmessage = (event) => {
+        if (event.data instanceof Float32Array) this.handleFrame(event.data);
+      };
+      sourceNode = context.createMediaStreamSource(stream);
+      sourceNode.connect(captureNode);
+      // Chromium only renders a worklet node that reaches the destination;
+      // the processor writes no output, so nothing is audible.
+      captureNode.connect(context.destination);
+    } catch (e) {
+      // The stream is already live: release it so the OS recording
+      // indicator does not stay on for a session that never started.
+      for (const track of stream.getTracks()) track.stop();
+      await context.close().catch(() => undefined);
+      throw e;
+    }
 
     // If the OS revokes the stream mid-session (e.g. device unplugged),
     // surface it and tear down.
@@ -551,7 +629,7 @@ export class LiveRecordingSession {
     this.stream = stream;
     this.context = context;
     this.sourceNode = sourceNode;
-    this.processor = processor;
+    this.captureNode = captureNode;
     this.recording = true;
     this.paused = false;
     this.startedAtMs = this.clock();
@@ -598,13 +676,14 @@ export class LiveRecordingSession {
 
     const tail = this.chunker.flush();
 
-    const processor = this.processor;
-    this.processor = null;
+    const captureNode = this.captureNode;
+    this.captureNode = null;
     this.sourceNode = null;
-    if (processor) {
-      processor.onaudioprocess = null;
+    if (captureNode) {
+      captureNode.port.onmessage = null;
+      captureNode.port.close();
       try {
-        processor.disconnect();
+        captureNode.disconnect();
       } catch {
         // already disconnected
       }

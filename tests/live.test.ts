@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  CAPTURE_FRAME_SAMPLES,
+  CAPTURE_PROCESSOR_NAME,
+  CAPTURE_WORKLET_SOURCE,
   LIVE_SAMPLE_RATE,
   LiveChunker,
   LiveRecordingSession,
@@ -31,6 +34,41 @@ function makeSession(
     onError: overrides?.onError ?? ((e) => errors.push(e)),
     clock: overrides?.clock,
   });
+}
+
+/**
+ * Evaluate the worklet module source headlessly with a stand-in for the
+ * AudioWorkletProcessor base class and registerProcessor, and return the
+ * processor classes it registered.
+ */
+function loadWorkletProcessors(): Record<string, new () => FakeProcessor> {
+  const registered: Record<string, new () => FakeProcessor> = {};
+  new Function("AudioWorkletProcessor", "registerProcessor", CAPTURE_WORKLET_SOURCE)(
+    FakeProcessorBase,
+    (name: string, cls: new () => FakeProcessor) => {
+      registered[name] = cls;
+    },
+  );
+  return registered;
+}
+
+class FakeProcessorBase {
+  port = {
+    messages: [] as Float32Array[],
+    transfers: [] as unknown[],
+    postMessage(message: Float32Array, transfer?: unknown[]): void {
+      this.messages.push(message);
+      this.transfers.push(transfer);
+    },
+  };
+}
+
+interface FakeProcessor extends FakeProcessorBase {
+  process(inputs: Float32Array[][]): boolean;
+}
+
+function quantum(start: number, length = 128): Float32Array {
+  return new Float32Array(length).map((_, i) => start + i);
 }
 
 // ---------------------------------------------------------------------------
@@ -399,9 +437,50 @@ describe("LiveRecordingSession", () => {
     expect(world.contexts[0].sampleRate).toBe(16000);
     expect(session.isRecording()).toBe(true);
     expect(session.isPaused()).toBe(false);
-    // Processor wired into the graph (source -> processor -> destination).
+    // Capture node wired into the graph (source -> worklet -> destination).
     expect(world.contexts[0].sourceNode.connectCount).toBe(1);
-    expect(world.contexts[0].processor.connectCount).toBe(1);
+    expect(world.contexts[0].captureNode.connectCount).toBe(1);
+  });
+
+  it("installs the capture worklet from the session's inline source", async () => {
+    const world = makeWorld();
+    const session = makeSession(world);
+    await session.start("microphone");
+    expect(world.deps.createCaptureNode).toHaveBeenCalledTimes(1);
+    expect(world.deps.createCaptureNode).toHaveBeenCalledWith(
+      world.contexts[0],
+      CAPTURE_WORKLET_SOURCE,
+      CAPTURE_PROCESSOR_NAME,
+    );
+    await session.stop();
+  });
+
+  it("tears down the stream and context when the worklet cannot be installed", async () => {
+    const world = makeWorld({ workletThrows: true });
+    const session = makeSession(world);
+    await expect(session.start("microphone")).rejects.toThrow(
+      /AudioWorklet unavailable/,
+    );
+    expect(world.micStream.tracks[0].stopped).toBe(true);
+    expect(world.contexts[0].closed).toBe(true);
+    expect(session.isRecording()).toBe(false);
+  });
+
+  it("ignores port messages that are not sample frames", async () => {
+    const world = makeWorld();
+    const chunks: Float32Array[] = [];
+    const session = makeSession(world, {
+      sampleRate: 100,
+      chunkSeconds: 1,
+      onChunk: (pcm) => chunks.push(pcm),
+    });
+    await session.start("microphone");
+    world.contexts[0].captureNode.port.onmessage!({ data: "not audio" });
+    world.contexts[0].captureNode.port.onmessage!({ data: [1, 2, 3] });
+    expect(chunks).toHaveLength(0);
+    feed(world.contexts[0], new Float32Array(100));
+    expect(chunks).toHaveLength(1);
+    await session.stop();
   });
 
   it("emits chunks through onChunk as frames arrive", async () => {
@@ -486,7 +565,9 @@ describe("LiveRecordingSession", () => {
     expect(tail!.length).toBe(120);
     expect(world.micStream.tracks[0].stopped).toBe(true);
     expect(ctx.closed).toBe(true);
-    expect(ctx.processor.disconnectCount).toBe(1);
+    expect(ctx.captureNode.disconnectCount).toBe(1);
+    expect(ctx.captureNode.port.closed).toBe(true);
+    expect(ctx.captureNode.port.onmessage).toBeNull();
     expect(session.isRecording()).toBe(false);
     // Stopping again is a no-op.
     expect(await session.stop()).toBeNull();
@@ -684,5 +765,63 @@ describe("LiveSessionRegistry", () => {
     expect(reg.tryClaim(b)).toBe(true);
     b.recording = true;
     expect(reg.isRecording()).toBe(true);
+  });
+});
+
+describe("CAPTURE_WORKLET_SOURCE", () => {
+  it("registers the capture processor under CAPTURE_PROCESSOR_NAME", () => {
+    const processors = loadWorkletProcessors();
+    expect(Object.keys(processors)).toEqual([CAPTURE_PROCESSOR_NAME]);
+  });
+
+  it("posts one transferred frame once enough render quanta arrive", () => {
+    const Processor = loadWorkletProcessors()[CAPTURE_PROCESSOR_NAME];
+    const processor = new Processor();
+    const quantaPerFrame = CAPTURE_FRAME_SAMPLES / 128;
+
+    for (let i = 0; i < quantaPerFrame - 1; i++) {
+      expect(processor.process([[quantum(i * 128)]])).toBe(true);
+    }
+    expect(processor.port.messages).toHaveLength(0);
+
+    processor.process([[quantum((quantaPerFrame - 1) * 128)]]);
+    expect(processor.port.messages).toHaveLength(1);
+    const frame = processor.port.messages[0];
+    expect(frame.length).toBe(CAPTURE_FRAME_SAMPLES);
+    expect(frame[0]).toBe(0);
+    expect(frame[CAPTURE_FRAME_SAMPLES - 1]).toBe(CAPTURE_FRAME_SAMPLES - 1);
+    // The frame's buffer is transferred, and the next frame is a fresh one.
+    expect(processor.port.transfers[0]).toEqual([frame.buffer]);
+    for (let i = 0; i < quantaPerFrame; i++) {
+      processor.process([[quantum(CAPTURE_FRAME_SAMPLES + i * 128)]]);
+    }
+    expect(processor.port.messages).toHaveLength(2);
+    expect(processor.port.messages[1]).not.toBe(frame);
+    expect(processor.port.messages[1][0]).toBe(CAPTURE_FRAME_SAMPLES);
+  });
+
+  it("splits a quantum that straddles a frame boundary without losing samples", () => {
+    const Processor = loadWorkletProcessors()[CAPTURE_PROCESSOR_NAME];
+    const processor = new Processor();
+    const odd = 100; // does not divide the frame size
+    let sample = 0;
+    while (processor.port.messages.length < 2) {
+      processor.process([[quantum(sample, odd)]]);
+      sample += odd;
+    }
+    const [first, second] = processor.port.messages;
+    expect(Array.from(first)).toEqual(
+      Array.from({ length: CAPTURE_FRAME_SAMPLES }, (_, i) => i),
+    );
+    expect(second[0]).toBe(CAPTURE_FRAME_SAMPLES);
+    expect(second[CAPTURE_FRAME_SAMPLES - 1]).toBe(2 * CAPTURE_FRAME_SAMPLES - 1);
+  });
+
+  it("keeps running when the input has no channel yet", () => {
+    const Processor = loadWorkletProcessors()[CAPTURE_PROCESSOR_NAME];
+    const processor = new Processor();
+    expect(processor.process([])).toBe(true);
+    expect(processor.process([[]])).toBe(true);
+    expect(processor.port.messages).toHaveLength(0);
   });
 });

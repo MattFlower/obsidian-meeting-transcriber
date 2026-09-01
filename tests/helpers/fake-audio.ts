@@ -1,6 +1,6 @@
 import { vi } from "vitest";
 
-import type { LiveCaptureDeps } from "../../src/live";
+import type { LiveAudioContextLike, LiveCaptureDeps } from "../../src/live";
 
 // ---------------------------------------------------------------------------
 // Fakes for the Web Audio / MediaStream surface (headless: no DOM). Shared by
@@ -42,10 +42,18 @@ export class FakeStream {
   }
 }
 
-export class FakeScriptProcessor {
-  onaudioprocess:
-    | ((e: { inputBuffer: { getChannelData(c: number): Float32Array } }) => void)
-    | null = null;
+export class FakeCapturePort {
+  onmessage: ((event: { data: unknown }) => void) | null = null;
+  closed = false;
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
+/** Stands in for the AudioWorkletNode the session captures through. */
+export class FakeCaptureNode {
+  port = new FakeCapturePort();
   connectCount = 0;
   disconnectCount = 0;
 
@@ -72,7 +80,7 @@ export class FakeSourceNode {
 
 export class FakeAudioContext {
   sampleRate: number;
-  processor = new FakeScriptProcessor();
+  captureNode = new FakeCaptureNode();
   sourceNode = new FakeSourceNode();
   closed = false;
   destination = {};
@@ -83,10 +91,6 @@ export class FakeAudioContext {
 
   createMediaStreamSource(_stream: unknown): FakeSourceNode {
     return this.sourceNode;
-  }
-
-  createScriptProcessor(): FakeScriptProcessor {
-    return this.processor;
   }
 
   async close(): Promise<void> {
@@ -104,6 +108,7 @@ export interface FakeWorld {
 export function makeWorld(opts?: {
   displayAudio?: boolean;
   displayThrows?: boolean;
+  workletThrows?: boolean;
 }): FakeWorld {
   const micStream = new FakeStream([new FakeTrack("audio")]);
   const displayStream = new FakeStream([
@@ -124,13 +129,19 @@ export function makeWorld(opts?: {
       contexts.push(ctx);
       return ctx;
     }),
+    createCaptureNode: opts?.workletThrows
+      ? vi.fn(async () => {
+          throw new Error("AudioWorklet unavailable");
+        })
+      : vi.fn(
+          async (context: LiveAudioContextLike) =>
+            (context as FakeAudioContext).captureNode,
+        ),
   };
   return { deps, micStream, displayStream, contexts };
 }
 
-/** Push one frame of samples through the fake script processor. */
+/** Deliver one frame of samples through the fake capture node's port. */
 export function feed(ctx: FakeAudioContext, samples: Float32Array): void {
-  ctx.processor.onaudioprocess!({
-    inputBuffer: { getChannelData: () => samples },
-  });
+  ctx.captureNode.port.onmessage!({ data: samples });
 }

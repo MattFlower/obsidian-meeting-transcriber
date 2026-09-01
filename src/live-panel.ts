@@ -57,6 +57,8 @@ function browserCaptureDeps(): LiveCaptureDeps {
     getDisplayMedia: (constraints) => md.getDisplayMedia(constraints),
     enumerateDevices: () => md.enumerateDevices(),
     createAudioContext: (sampleRate) => new AudioContext({ sampleRate }),
+    createCaptureNode: (context, source, processorName) =>
+      createWorkletCaptureNode(context as AudioContext, source, processorName),
   };
 }
 
@@ -93,6 +95,35 @@ function correctTranscriptWord(
     );
   }
   return markdown;
+}
+
+/**
+ * Install the capture worklet from its inline source and return its node.
+ * The module is loaded through a blob: URL because the plugin ships as one
+ * bundled file with nothing to serve a worklet script from. A stereo input
+ * (some loopback devices) is mixed down to one channel at the node, as the
+ * former ScriptProcessorNode(4096, 1, 1) did.
+ */
+async function createWorkletCaptureNode(
+  context: AudioContext,
+  source: string,
+  processorName: string,
+): Promise<AudioWorkletNode> {
+  const url = URL.createObjectURL(
+    new Blob([source], { type: "application/javascript" }),
+  );
+  try {
+    await context.audioWorklet.addModule(url);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  return new AudioWorkletNode(context, processorName, {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    channelCount: 1,
+    channelCountMode: "explicit",
+    outputChannelCount: [1],
+  });
 }
 
 export const LIVE_PANEL_VIEW_TYPE = "meeting-transcriber-live";

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 
 /**
@@ -102,9 +103,99 @@ export function loadSherpaOnnx(pluginDir: string): any {
   return pluginRequire("sherpa-onnx-node");
 }
 
+// ---------------------------------------------------------------------------
+// Recognizer holder
+// ---------------------------------------------------------------------------
+
+/**
+ * The slice of sherpa-onnx-node's `OfflineRecognizer` / `OfflineStream` this
+ * module uses, typed structurally so nothing here imports the addon's types.
+ */
+export interface OfflineStreamLike {
+  acceptWaveform(waveform: { samples: Float32Array; sampleRate: number }): void;
+}
+
+export interface OfflineRecognizerLike {
+  createStream(): OfflineStreamLike;
+  decodeAsync(
+    stream: OfflineStreamLike,
+  ): Promise<{ text?: string } | null | undefined>;
+}
+
+interface RecognizerHolder {
+  key: string;
+  recognizer: Promise<OfflineRecognizerLike>;
+}
+
+/**
+ * The single process-wide recognizer. Loading the three ONNX models takes
+ * seconds and hundreds of MB of native memory, so it is created once and
+ * shared; sherpa-onnx's offline recognizer may be used from several callers
+ * at once as long as each decode uses its own stream.
+ */
+let holder: RecognizerHolder | null = null;
+
+function recognizerKey(modelDir: string, pluginDir: string): string {
+  return `${pluginDir.replace(/\/+$/, "")}\n${modelDir.replace(/\/+$/, "")}`;
+}
+
+/**
+ * Return the recognizer for `modelDir`, creating it on first use via
+ * `OfflineRecognizer.createAsync` (model loading runs off the main thread)
+ * and reusing it afterwards. Only one recognizer is held at a time: asking
+ * for a different model or plugin directory drops the previous one.
+ *
+ * The model files are re-checked on every call. A deleted or moved model
+ * therefore surfaces as a clear error and drops the stale recognizer instead
+ * of silently keeping the old model in memory. A failed creation is not
+ * cached, so the next call retries.
+ */
+export async function getRecognizer(
+  modelDir: string,
+  pluginDir: string,
+  exists: (path: string) => boolean = existsSync,
+): Promise<OfflineRecognizerLike> {
+  const missing = missingModelFiles(modelDir, exists);
+  if (missing.length > 0) {
+    holder = null;
+    throw new Error(`Parakeet model files are missing: ${missing.join(", ")}`);
+  }
+
+  const key = recognizerKey(modelDir, pluginDir);
+  let entry = holder;
+  if (entry === null || entry.key !== key) {
+    const sherpa = loadSherpaOnnx(pluginDir);
+    const recognizer: Promise<OfflineRecognizerLike> =
+      sherpa.OfflineRecognizer.createAsync(buildRecognizerConfig(modelDir));
+    const created: RecognizerHolder = { key, recognizer };
+    holder = created;
+    recognizer.catch(() => {
+      if (holder === created) holder = null;
+    });
+    entry = created;
+  }
+  return entry.recognizer;
+}
+
+/**
+ * Drop the cached recognizer. sherpa-onnx-node exposes no dispose(), so the
+ * native memory is reclaimed when the addon finalizes the handle after GC;
+ * dropping the only long-lived JS reference is all a caller can do. Used on
+ * plugin unload and when the model directory setting changes. A transcribe()
+ * already in flight keeps its own reference until its decode completes.
+ */
+export function releaseRecognizer(): void {
+  holder = null;
+}
+
 /**
  * Transcribe 16 kHz mono PCM samples into text using the Parakeet model in
  * `modelDir`.
+ *
+ * The recognizer is created once and cached (see `getRecognizer`), and the
+ * decode runs on a libuv worker via `decodeAsync`, so neither model loading
+ * nor decoding blocks the Electron renderer thread — the live panel calls
+ * this once per chunk while audio capture continues.
  *
  * The native addon is loaded lazily via a require anchored at `pluginDir`
  * (and remains an esbuild external), so importing this module never loads the
@@ -119,20 +210,9 @@ export async function transcribe(
   pluginDir: string,
   sampleRate = 16000,
 ): Promise<string> {
-  const sherpa = loadSherpaOnnx(pluginDir);
-  const recognizer = new sherpa.OfflineRecognizer(
-    buildRecognizerConfig(modelDir),
-  );
-  try {
-    const stream = recognizer.createStream();
-    stream.acceptWaveform({ samples: pcm, sampleRate });
-    recognizer.decode(stream);
-    const result = recognizer.getResult(stream);
-    return (result?.text ?? "").trim();
-  } finally {
-    // Release the native handle if the addon exposes a dispose method.
-    if (typeof recognizer.dispose === "function") {
-      recognizer.dispose();
-    }
-  }
+  const recognizer = await getRecognizer(modelDir, pluginDir);
+  const stream = recognizer.createStream();
+  stream.acceptWaveform({ samples: pcm, sampleRate });
+  const result = await recognizer.decodeAsync(stream);
+  return (result?.text ?? "").trim();
 }

@@ -15,7 +15,7 @@ import {
   type TranscriberSettings,
 } from "./settings";
 import { decodeToMono16k, isAudioFile } from "./audio";
-import { modelFilePaths, transcribe } from "./transcriber";
+import { modelFilePaths, releaseRecognizer, transcribe } from "./transcriber";
 import { downloadModel } from "./model-download";
 import { summarizeTranscript } from "./summarize";
 import {
@@ -145,6 +145,9 @@ export default class MeetingTranscriberPlugin extends Plugin {
 
   onunload(): void {
     this.app.workspace.detachLeavesOfType(LIVE_PANEL_VIEW_TYPE);
+    // Drop the cached Parakeet recognizer so its native memory can be
+    // reclaimed once the plugin's references are gone.
+    releaseRecognizer();
     // Obsidian removes registered commands and the status bar item for us.
   }
 

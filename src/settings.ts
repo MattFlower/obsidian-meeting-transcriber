@@ -1,6 +1,7 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type MeetingTranscriberPlugin from "./main";
 import type { LiveAudioSource } from "./live";
+import { releaseRecognizer } from "./transcriber";
 
 export type SummarizerBackend = "cloud" | "local" | "cli";
 
@@ -70,6 +71,9 @@ export class TranscriberSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.modelDir)
           .onChange(async (value) => {
             this.plugin.settings.modelDir = value.trim() || "models/parakeet";
+            // The cached recognizer belongs to the previous directory; drop
+            // it so the next transcription loads the newly configured model.
+            releaseRecognizer();
             await this.plugin.saveSettings();
           }),
       );

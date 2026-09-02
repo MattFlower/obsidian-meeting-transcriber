@@ -250,12 +250,15 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     this.pauseBtn = buttonRow.createEl("button", { text: "Pause" });
     this.pauseBtn.disabled = true;
     this.pauseBtn.onClickEvent(() => {
+      // The button stays enabled during the stop flush; a click there must
+      // not repaint the panel as idle while teardown is still running.
+      if (!this.session.isRecording() || this.stopping) return;
       if (this.session.isPaused()) {
         this.session.resume();
       } else {
         this.session.pause();
       }
-      this.updateStatus();
+      this.refreshUi();
     });
 
     this.statusEl = content.createDiv({ cls: "live-recording-status" });
@@ -285,9 +288,15 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     this.mirrorToStatusBar();
   }
 
+  /** Redraw buttons, panel status and status bar after a state transition. */
+  private refreshUi(): void {
+    this.setButtonsForState();
+    this.tick();
+  }
+
   private updateStatus(): void {
     if (this.statusEl) {
-      if (this.transcribing) {
+      if (this.transcribing && !this.session.isPaused()) {
         const t = formatClock(this.session.elapsedSeconds());
         this.statusEl.setText(`Transcribing chunk… ${t}`);
       } else if (this.session.isRecording()) {
@@ -312,7 +321,9 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
   private statusBarText(): string {
     if (!this.transcribing && !this.session.isRecording()) return "";
     const t = formatClock(this.session.elapsedSeconds());
-    if (this.transcribing) return `● Live: transcribing chunk… ${t}`;
+    if (this.transcribing && !this.session.isPaused()) {
+      return `● Live: transcribing chunk… ${t}`;
+    }
     return this.session.isPaused()
       ? `⏸ Live paused ${t}`
       : `● Live recording ${t}`;
@@ -467,9 +478,7 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     this.producedText = false;
     this.pump = Promise.resolve();
     this.deduper.reset();
-    this.setButtonsForState();
-    this.updateStatus();
-    this.mirrorToStatusBar();
+    this.refreshUi();
     this.startTicking();
   }
 
@@ -498,9 +507,7 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
       this.note = null;
       this.transcribing = false;
       this.host.releaseLiveSession(this);
-      this.setButtonsForState();
-      this.updateStatus();
-      this.mirrorToStatusBar();
+      this.refreshUi();
       new Notice("Live recording stopped.", 5000);
     }
   }

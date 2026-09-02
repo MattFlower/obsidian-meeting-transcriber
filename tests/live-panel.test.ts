@@ -148,6 +148,80 @@ describe("LiveRecordingPanel status bar", () => {
     expect(h.setStatus).not.toHaveBeenCalled();
   });
 
+  it("toggles the pause button label Pause -> Resume -> Pause and flips the status bar at once", async () => {
+    const h = makeHarness();
+    await openAndStart(h);
+    const owner = h.owner();
+    const { startStop, pause } = h.buttons();
+    expect(startStop.text).toBe("Stop recording");
+    expect(pause.disabled).toBe(false);
+    expect(pause.text).toBe("Pause");
+
+    pause.click();
+    expect(pause.text).toBe("Resume");
+    // The status bar flips immediately, not on the next 1 s tick.
+    expect(h.setStatus).toHaveBeenLastCalledWith(owner, "⏸ Live paused 00:00");
+
+    pause.click();
+    expect(pause.text).toBe("Pause");
+    expect(h.setStatus).toHaveBeenLastCalledWith(owner, "● Live recording 00:00");
+  });
+
+  it("ignores a Pause click that lands during the stop flush", async () => {
+    let finish!: (text: string) => void;
+    transcribeMock.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const h = makeHarness();
+    await openAndStart(h);
+    // A partial chunk becomes the tail that stopSession() transcribes.
+    feed(h.world.contexts[0], new Float32Array(16000 * 5));
+    h.buttons().startStop.click(); // Stop recording
+    await settle();
+    expect(transcribeMock).toHaveBeenCalledTimes(1);
+    const { startStop, pause } = h.buttons();
+    expect(startStop.text).toBe("Stop recording");
+
+    pause.click(); // still enabled while the tail is in flight
+    expect(startStop.text).toBe("Stop recording");
+    expect(pause.text).toBe("Pause");
+
+    finish("");
+    await settle();
+    expect(startStop.text).toBe("Start recording");
+    expect(pause.disabled).toBe(true);
+  });
+
+  it("shows the paused state even while a chunk is being transcribed", async () => {
+    let finish!: (text: string) => void;
+    transcribeMock.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const h = makeHarness();
+    await openAndStart(h);
+    const owner = h.owner();
+    feed(h.world.contexts[0], new Float32Array(16000 * 15));
+    await settle();
+    expect(h.setStatus).toHaveBeenLastCalledWith(
+      owner,
+      "● Live: transcribing chunk… 00:00",
+    );
+
+    h.buttons().pause.click();
+    expect(h.buttons().pause.text).toBe("Resume");
+    expect(h.setStatus).toHaveBeenLastCalledWith(owner, "⏸ Live paused 00:00");
+
+    finish("hello world");
+    await settle();
+    expect(h.setStatus).toHaveBeenLastCalledWith(owner, "⏸ Live paused 00:00");
+  });
+
   it("reports an in-flight chunk transcription, then returns to the clock", async () => {
     let finish!: (text: string) => void;
     transcribeMock.mockImplementationOnce(

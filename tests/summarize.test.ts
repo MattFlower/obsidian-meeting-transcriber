@@ -3,9 +3,11 @@ import {
   buildCliPrompt,
   buildSummarizePrompt,
   callChatCompletion,
+  extendedPath,
   parseSummaryResponse,
   runCliPrompt,
   sanitizeTags,
+  splitCommand,
   summarizeTranscript,
   type SpawnImpl,
   type SummarizerSettings,
@@ -183,16 +185,35 @@ function makeFakeSpawn(opts: {
   stdout?: string;
   stderr?: string;
   errorCode?: string;
+  /** Never emit "close", to exercise the timeout path. */
+  neverCloses?: boolean;
+  /** Emit this as an "error" on stdin before close. */
+  stdinError?: string;
 }) {
   const exitCode = opts.exitCode ?? 0;
   const stdout = opts.stdout ?? "";
   const stderr = opts.stderr ?? "";
-  const capture = { written: [] as string[], killed: false };
+  const capture = { written: [] as string[], ended: false, killed: false };
   const spawnImpl = ((file: string, args: string[]) => {
     const stdoutListeners: Array<(chunk: string) => void> = [];
     const stderrListeners: Array<(chunk: string) => void> = [];
+    const stdinListeners: Array<(err: Error) => void> = [];
     const childListeners: Record<string, Array<(...args: any[]) => void>> = {};
+    // Same shape as a real ChildProcess: the prompt goes to child.stdin.
     const child = {
+      stdin: {
+        write: (d: string) => {
+          capture.written.push(d);
+          return true;
+        },
+        end: () => {
+          capture.ended = true;
+        },
+        on: (ev: string, cb: (err: Error) => void) => {
+          if (ev === "error") stdinListeners.push(cb);
+          return undefined;
+        },
+      },
       stdout: {
         on: (ev: string, cb: (chunk: string) => void) => {
           if (ev === "data") stdoutListeners.push(cb);
@@ -204,10 +225,6 @@ function makeFakeSpawn(opts: {
           if (ev === "data") stderrListeners.push(cb);
           return undefined;
         },
-      },
-      write: (d: string) => {
-        capture.written.push(d);
-        return true;
       },
       on: (ev: string, cb: (...args: any[]) => void) => {
         (childListeners[ev] ??= []).push(cb);
@@ -221,12 +238,18 @@ function makeFakeSpawn(opts: {
     queueMicrotask(() => {
       stdoutListeners.forEach((cb) => cb(stdout));
       stderrListeners.forEach((cb) => cb(stderr));
+      const stdinError = opts.stdinError;
+      if (stdinError) {
+        stdinListeners.forEach((cb) => cb(new Error(stdinError)));
+      }
       if (opts.errorCode) {
         (childListeners["error"] ?? []).forEach((cb) =>
           cb({ code: opts.errorCode } as NodeJS.ErrnoException),
         );
       }
-      (childListeners["close"] ?? []).forEach((cb) => cb(exitCode));
+      if (!opts.neverCloses) {
+        (childListeners["close"] ?? []).forEach((cb) => cb(exitCode));
+      }
     });
     return child;
   }) as unknown as SpawnImpl;
@@ -244,6 +267,42 @@ describe("runCliPrompt", () => {
     expect(capture.written.join("")).toBe("the prompt");
   });
 
+  it("closes stdin after writing the prompt so the CLI sees end-of-input", async () => {
+    const { spawnImpl, capture } = makeFakeSpawn({ exitCode: 0, stdout: "ok" });
+    await runCliPrompt("claude -p", "the prompt", spawnImpl);
+    expect(capture.ended).toBe(true);
+  });
+
+  it("kills the child and rejects when it exceeds the timeout", async () => {
+    const { spawnImpl, capture } = makeFakeSpawn({ neverCloses: true });
+    await expect(
+      runCliPrompt("claude -p", "p", spawnImpl, 20),
+    ).rejects.toThrow(/timed out/);
+    expect(capture.killed).toBe(true);
+  });
+
+  it("rejects an empty command without spawning", async () => {
+    const { spawnImpl, capture } = makeFakeSpawn({});
+    await expect(runCliPrompt("   ", "p", spawnImpl)).rejects.toThrow(/empty/);
+    expect(capture.written).toEqual([]);
+  });
+
+  it("rejects an empty quoted command without spawning", async () => {
+    const { spawnImpl, capture } = makeFakeSpawn({});
+    await expect(runCliPrompt('"" -p', "p", spawnImpl)).rejects.toThrow(/empty/);
+    expect(capture.written).toEqual([]);
+  });
+
+  it("carries a stdin error into the failure message", async () => {
+    const { spawnImpl } = makeFakeSpawn({
+      exitCode: 1,
+      stdinError: "write EPIPE",
+    });
+    await expect(runCliPrompt("claude -p", "p", spawnImpl)).rejects.toThrow(
+      /exited with code 1.*stdin error: write EPIPE/s,
+    );
+  });
+
   it("rejects on non-zero exit with stderr in the message", async () => {
     const { spawnImpl } = makeFakeSpawn({
       exitCode: 1,
@@ -259,6 +318,96 @@ describe("runCliPrompt", () => {
     await expect(
       runCliPrompt("nope-cli -p", "p", spawnImpl),
     ).rejects.toThrow(/command not found: `nope-cli`/);
+  });
+});
+
+describe("splitCommand", () => {
+  it("splits on runs of whitespace", () => {
+    expect(splitCommand("  claude   -p ")).toEqual(["claude", "-p"]);
+  });
+
+  it("keeps a quoted path with spaces as one argument", () => {
+    expect(splitCommand('"/Applications/My Tools/claude" -p')).toEqual([
+      "/Applications/My Tools/claude",
+      "-p",
+    ]);
+    expect(splitCommand("'/opt/x y/codex' exec")).toEqual([
+      "/opt/x y/codex",
+      "exec",
+    ]);
+  });
+
+  it("returns [] for an empty command", () => {
+    expect(splitCommand("   ")).toEqual([]);
+  });
+});
+
+describe("extendedPath", () => {
+  it("appends common install directories after the inherited PATH", () => {
+    const out = extendedPath({ PATH: "/usr/bin:/bin" }, "darwin", "/Users/me");
+    expect(out.split(":")).toEqual([
+      "/usr/bin",
+      "/bin",
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      "/Users/me/.local/bin",
+      "/Users/me/.npm-global/bin",
+      "/Users/me/bin",
+    ]);
+  });
+
+  it("does not duplicate a directory already on PATH", () => {
+    const out = extendedPath(
+      { PATH: "/opt/homebrew/bin:/usr/bin" },
+      "linux",
+      "/home/me",
+    );
+    expect(out.startsWith("/opt/homebrew/bin:/usr/bin:")).toBe(true);
+    expect(out.split(":").filter((p) => p === "/opt/homebrew/bin")).toHaveLength(1);
+  });
+
+  it("leaves PATH untouched on Windows", () => {
+    expect(extendedPath({ Path: "C:\\Windows" }, "win32", "C:\\Users\\me")).toBe(
+      "C:\\Windows",
+    );
+  });
+});
+
+// These run the real child_process path (no spawnImpl) so the contract with
+// Node's ChildProcess is exercised, not a fake of it.
+describe("runCliPrompt against a real child process", () => {
+  const node = `"${process.execPath}"`;
+
+  it("writes the prompt to stdin and returns stdout", async () => {
+    const out = await runCliPrompt(
+      `${node} -e "process.stdin.on('data',(d)=>process.stdout.write(d))"`,
+      "hello from stdin",
+    );
+    expect(out).toBe("hello from stdin");
+  });
+
+  it("reports a non-zero exit with the stderr tail", async () => {
+    await expect(
+      runCliPrompt(
+        `${node} -e "process.stderr.write('boom');process.exit(2)"`,
+        "p",
+      ),
+    ).rejects.toThrow(/exited with code 2.*boom/s);
+  });
+
+  it("rejects with 'command not found' for a missing executable", async () => {
+    await expect(
+      runCliPrompt("definitely-not-a-real-cli-4f1c -p", "p"),
+    ).rejects.toThrow(/command not found/);
+  });
+
+  it("survives a child that exits without reading its stdin", async () => {
+    // A 1 MiB prompt cannot fit the pipe buffer, so the write hits EPIPE.
+    const out = await runCliPrompt(
+      `${node} -e process.exit(0)`,
+      "x".repeat(1 << 20),
+    );
+    expect(out).toBe("");
   });
 });
 

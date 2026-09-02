@@ -1,5 +1,7 @@
 import { createWriteStream } from "node:fs";
 import { promises as fsp } from "node:fs";
+import { once } from "node:events";
+import { finished } from "node:stream/promises";
 import * as path from "node:path";
 
 /** Hugging Face repo hosting the Parakeet TDT 0.6B v2 int8 ONNX model. */
@@ -33,27 +35,36 @@ export interface DownloadProgress {
   count: number;
 }
 
-/** Resolve when the writable stream has flushed and closed. */
-function finishStream(stream: NodeJS.WritableStream): Promise<void> {
-  return new Promise((resolve, reject) => {
-    stream.once("error", reject);
-    stream.once("close", () => resolve());
-    stream.end();
-  });
+export interface DownloadOptions {
+  /**
+   * Minimum milliseconds between two progress reports for the same file
+   * (default 250). A 600 MB download arrives in tens of thousands of
+   * network chunks, and every report repaints a Notice and the status bar.
+   * The first report of a file and the final one (received === total) are
+   * always delivered.
+   */
+  minProgressIntervalMs?: number;
+  /** Injectable clock for the throttle (tests). */
+  now?: () => number;
 }
 
-/** Resolve when the writable stream has drained (backpressure). */
-function waitForDrain(stream: NodeJS.WritableStream): Promise<void> {
-  return new Promise((resolve, reject) => {
-    stream.once("drain", resolve);
-    stream.once("error", reject);
-  });
+const DEFAULT_PROGRESS_INTERVAL_MS = 250;
+
+interface ProgressThrottle {
+  minIntervalMs: number;
+  now: () => number;
 }
 
 /**
  * Stream a single file from `url` to `destPath`, writing chunks to disk as
- * they arrive and reporting incremental (byte-level) progress. Falls back to
- * buffering only when the response exposes no web stream body (e.g. some
+ * they arrive and reporting incremental (byte-level) progress.
+ *
+ * The bytes go to a sibling `<destPath>.part` file that is renamed into
+ * place only once fully written and closed, so an interrupted download never
+ * leaves a truncated model file that would pass the "all files present"
+ * check and then fail inside the recognizer. On any error the write stream
+ * is destroyed and the partial file removed before rethrowing. Falls back to
+ * buffering only when the response exposes no web-stream body (e.g. some
  * test mocks).
  */
 async function downloadOne(
@@ -62,11 +73,11 @@ async function downloadOne(
   file: string,
   index: number,
   count: number,
-  onProgress?: (p: DownloadProgress) => void,
-  doFetch?: typeof fetch,
+  onProgress: ((p: DownloadProgress) => void) | undefined,
+  doFetch: typeof fetch,
+  throttle: ProgressThrottle,
 ): Promise<void> {
-  const doFetchImpl = doFetch ?? fetch;
-  const res = await doFetchImpl(url);
+  const res = await doFetch(url);
   if (!res.ok) {
     throw new Error(`Failed to download ${file}: HTTP ${res.status}`);
   }
@@ -76,46 +87,79 @@ async function downloadOne(
       ? Number(totalHeader)
       : null;
 
-  const out = createWriteStream(destPath);
+  const partPath = `${destPath}.part`;
+  const out = createWriteStream(partPath);
   let received = 0;
-  const report = () => onProgress?.({ file, received, total, index, count });
+  let lastReportAt = -Infinity;
+  let lastReported = -1;
+  const report = (final: boolean) => {
+    if (!onProgress) return;
+    const now = throttle.now();
+    if (!final && now - lastReportAt < throttle.minIntervalMs) return;
+    if (received === lastReported) return;
+    lastReportAt = now;
+    lastReported = received;
+    onProgress({ file, received, total, index, count });
+  };
 
   const body = res.body;
-  if (body && typeof body.getReader === "function") {
-    const reader = body.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value && value.byteLength > 0) {
-        const buf = Buffer.from(value);
-        if (!out.write(buf)) {
-          await waitForDrain(out);
+  const reader =
+    body && typeof body.getReader === "function" ? body.getReader() : null;
+  try {
+    if (reader) {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.byteLength > 0) {
+          const buf = Buffer.from(value);
+          if (!out.write(buf)) {
+            // Backpressure: wait for the disk to catch up. `once` rejects if
+            // the stream errors meanwhile and removes its listeners either
+            // way, so a long download does not pile up 'error' listeners.
+            await once(out, "drain");
+          }
+          received += buf.length;
+          report(false);
         }
-        received += buf.length;
-        report();
       }
+    } else {
+      // Fallback for responses without a readable web-stream body.
+      const buf = Buffer.from(await res.arrayBuffer());
+      out.write(buf);
+      received = buf.length;
     }
-  } else {
-    // Fallback for responses without a readable web-stream body.
-    const buf = Buffer.from(await res.arrayBuffer());
-    out.write(buf);
-    received = buf.length;
-    report();
+    out.end();
+    // Resolves once the data is flushed and the descriptor closed (fs
+    // streams auto-destroy), so the rename below never races the close.
+    await finished(out);
+  } catch (e) {
+    out.destroy();
+    await finished(out).catch(() => undefined);
+    await reader?.cancel().catch(() => undefined);
+    await fsp.rm(partPath, { force: true });
+    throw e;
   }
-  await finishStream(out);
+  await fsp.rename(partPath, destPath);
+  report(true);
 }
 
 /**
  * Download all model files into `destDir`, streaming each to disk and
  * reporting incremental progress via `onProgress`. `fetchImpl` is injectable
- * for tests.
+ * for tests; `options` tunes progress throttling.
  */
 export async function downloadModel(
   destDir: string,
   onProgress?: (p: DownloadProgress) => void,
   fetchImpl?: typeof fetch,
+  options?: DownloadOptions,
 ): Promise<void> {
   await fsp.mkdir(destDir, { recursive: true });
+  const throttle: ProgressThrottle = {
+    minIntervalMs:
+      options?.minProgressIntervalMs ?? DEFAULT_PROGRESS_INTERVAL_MS,
+    now: options?.now ?? (() => Date.now()),
+  };
   const urls = modelFileUrls();
   for (let i = 0; i < MODEL_FILES.length; i++) {
     const file = MODEL_FILES[i];
@@ -126,7 +170,8 @@ export async function downloadModel(
       i,
       MODEL_FILES.length,
       onProgress,
-      fetchImpl,
+      fetchImpl ?? fetch,
+      throttle,
     );
   }
 }

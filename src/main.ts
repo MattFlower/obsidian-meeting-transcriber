@@ -441,11 +441,16 @@ export default class MeetingTranscriberPlugin extends Plugin {
       const transcript = extractTranscript(content) || content;
       const result = await summarizeTranscript(this.settings, transcript);
       // 1) Insert/replace the `## Summary` section in the body, preserving the
-      //    existing frontmatter bytes verbatim.
-      const updated = applySummaryToBody(content, result.summary);
-      await this.app.vault.modify(file, updated);
+      //    existing frontmatter bytes verbatim. vault.process re-reads the
+      //    note under Obsidian's write lock, so edits made while the LLM was
+      //    running are kept rather than overwritten with the stale `content`.
+      await this.app.vault.process(file, (current) =>
+        applySummaryToBody(current, result.summary),
+      );
       // 2) Update frontmatter (merge tags, set description) through Obsidian's
-      //    frontmatter API so normal Obsidian frontmatter is preserved.
+      //    frontmatter API so normal Obsidian frontmatter is preserved. Both
+      //    steps are idempotent, so re-running the command repairs a note
+      //    left half-updated by a failure between them.
       await this.app.fileManager.processFrontMatter(file, (fm) => {
         mergeSummaryIntoFrontmatter(fm, result);
       });

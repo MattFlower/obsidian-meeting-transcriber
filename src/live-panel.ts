@@ -549,9 +549,7 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
   /** Record in the note that the session produced no transcript text. */
   private async markNoSpeech(note: TFile): Promise<void> {
     try {
-      const content = await this.app.vault.read(note);
-      await this.app.vault.modify(
-        note,
+      await this.app.vault.process(note, (content) =>
         appendToTranscriptSection(content, "_No speech detected._"),
       );
     } catch {
@@ -576,16 +574,17 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
         const deduped = this.deduper.append(text);
         const correction = this.deduper.takeCorrection();
         if (deduped || correction) {
-          const content = await this.app.vault.read(note);
-          const corrected = correction
-            ? correctTranscriptWord(content, correction)
-            : content;
-          const updated = deduped
-            ? appendToTranscriptSection(corrected, deduped)
-            : corrected;
-          if (updated !== content) {
-            await this.app.vault.modify(note, updated);
-          }
+          // vault.process is an atomic read-modify-write, so an edit the
+          // user makes in the open note between chunks is never overwritten
+          // by a copy read a moment earlier.
+          await this.app.vault.process(note, (content) => {
+            const corrected = correction
+              ? correctTranscriptWord(content, correction)
+              : content;
+            return deduped
+              ? appendToTranscriptSection(corrected, deduped)
+              : corrected;
+          });
         }
       }
     } finally {

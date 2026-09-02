@@ -91,12 +91,13 @@ microphone.** The first microphone capture triggers the OS permission prompt.
 
 ## Setup
 
-## Setup
-
 1. Enable the plugin in a desktop vault.
 2. Run **Download Parakeet model** (one-time, ~600 MB).
-3. For summarization, set the LLM **base URL**, **API key** (leave empty for
-   local servers such as Ollama), and **model** in the plugin settings.
+3. For summarization, pick a **Summarization backend** in the plugin
+   settings: *Cloud* (base URL, API key, model), *Local* (an
+   OpenAI-compatible server on this machine such as Ollama or LM Studio), or
+   *Local CLI* (a command such as `claude -p` that reads the prompt on stdin
+   and prints the answer; if it is not found, give an absolute path).
 
 ## Settings
 
@@ -104,9 +105,13 @@ microphone.** The first microphone capture triggers the OS permission prompt.
 | --- | --- | --- |
 | Model directory | `models/parakeet` | Vault-relative folder with the ONNX model files |
 | Transcription output folder | `Meetings` | Where transcription notes are created |
-| LLM base URL | `https://api.openai.com/v1` | OpenAI-compatible API base URL |
-| LLM API key | *(empty)* | Bearer token; empty for local servers |
-| LLM model | `gpt-4o-mini` | Model name sent to the endpoint |
+| Summarization backend | `cloud` | `cloud` (HTTP API + key), `local` (OpenAI-compatible server on this machine), or `cli` (a local CLI such as `claude -p`) |
+| Cloud LLM base URL | `https://api.openai.com/v1` | OpenAI-compatible API base URL |
+| Cloud LLM API key | *(empty)* | Bearer token for the cloud backend |
+| Cloud LLM model | `gpt-4o-mini` | Model name sent to the endpoint |
+| Local LLM base URL | `http://localhost:11434/v1` | Local OpenAI-compatible server (Ollama, LM Studio); no key needed |
+| Local LLM model | `llama3.1` | Model name sent to the local server |
+| CLI command | `claude -p` | Command that reads the prompt on stdin and prints the answer. Homebrew, `/usr/local/bin`, `~/.local/bin` and npm-global directories are searched; if the command is still not found, give an absolute path (quoted if it contains spaces) |
 | Default tags | `meeting` | Comma-separated tags for new notes |
 | Live recording source | `microphone` | Pre-selected source for the live-recording modal; system audio requires a loopback device on most platforms (see *System audio capture*) |
 | Live chunk length (seconds) | `15` | How often live audio is transcribed and appended to the note (5–60) |

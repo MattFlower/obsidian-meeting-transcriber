@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { homedir } from "node:os";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -163,19 +164,29 @@ export function buildCliPrompt(transcript: string): string {
 }
 
 /**
- * Minimal structural shape of the child process used by runCliPrompt, so
- * tests can inject a fake without the real node:child_process instance.
+ * Minimal structural shape of the child process used by runCliPrompt. It is
+ * the subset of Node's ChildProcess that is actually used, including the
+ * `stdin` stream the prompt is written to, so a fake in tests has the same
+ * shape as the real object. (An earlier fake carried a `write` method the
+ * real process lacks, which hid a bug that broke this backend outright.)
  */
-export interface CliChildProcess {
-  stdout: CliChildStream | null;
-  stderr: CliChildStream | null;
-  write(data: string): void | boolean;
-  on(event: string, listener: (...args: any[]) => void): unknown;
-  kill(signal?: NodeJS.Signals): boolean;
+export interface CliChildStream {
+  on(event: "data", listener: (chunk: string | Buffer) => void): unknown;
+  setEncoding?(encoding: BufferEncoding): unknown;
 }
 
-export interface CliChildStream {
-  on(event: "data", listener: (chunk: string) => void): unknown;
+export interface CliChildStdin {
+  write(data: string): boolean;
+  end(): void;
+  on(event: "error", listener: (err: Error) => void): unknown;
+}
+
+export interface CliChildProcess {
+  stdin: CliChildStdin | null;
+  stdout: CliChildStream | null;
+  stderr: CliChildStream | null;
+  on(event: string, listener: (...args: any[]) => void): unknown;
+  kill(signal?: NodeJS.Signals): boolean;
 }
 
 export type SpawnImpl = (file: string, args: string[]) => CliChildProcess;
@@ -184,44 +195,133 @@ export type SpawnImpl = (file: string, args: string[]) => CliChildProcess;
 export const CLI_TIMEOUT_MS = 3 * 60 * 1000;
 
 /**
- * Run a local CLI summarizer: split `command` on whitespace into argv (no
- * shell, so no injection), write `prompt` to stdin, and resolve with the
- * trimmed stdout on exit code 0. Rejects with a useful Error on a non-zero
- * exit (stderr tail included), on ENOENT ("command not found"), or after a
- * 3-minute timeout (the child is killed). `spawnImpl` is injectable for
+ * Split a command line into argv without a shell: whitespace separates
+ * arguments, and single or double quotes group text that contains spaces
+ * (an absolute path such as `"/Applications/My Tools/claude" -p`). Quotes
+ * are removed; there is no escaping or variable expansion. Pure so it can
+ * be tested.
+ */
+export function splitCommand(command: string): string[] {
+  const argv: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let inToken = false;
+  for (const ch of command) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      inToken = true;
+    } else if (/\s/.test(ch)) {
+      if (inToken) argv.push(current);
+      current = "";
+      inToken = false;
+    } else {
+      current += ch;
+      inToken = true;
+    }
+  }
+  if (inToken) argv.push(current);
+  return argv;
+}
+
+/**
+ * Directories where user-installed CLIs commonly live but that a desktop-
+ * launched Obsidian does not have on PATH: on macOS the app is a child of
+ * launchd, not of a login shell, so it inherits /usr/bin:/bin:/usr/sbin:/sbin
+ * and never sees Homebrew, npm-global, or ~/.local installs. They are
+ * appended after the inherited PATH, so anything already found there still
+ * wins. Windows GUI apps inherit the user's PATH, so it is returned as is.
+ * Pure so it can be tested.
+ */
+export function extendedPath(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+  home: string = homedir(),
+): string {
+  const inherited = env.PATH ?? env.Path ?? "";
+  if (platform === "win32") return inherited;
+  const parts = inherited.split(":").filter((p) => p.length > 0);
+  const seen = new Set(parts);
+  for (const dir of [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    `${home}/.local/bin`,
+    `${home}/.npm-global/bin`,
+    `${home}/bin`,
+  ]) {
+    if (!seen.has(dir)) {
+      seen.add(dir);
+      parts.push(dir);
+    }
+  }
+  return parts.join(":");
+}
+
+/**
+ * Run a local CLI summarizer: split `command` into argv (no shell, so no
+ * injection), write `prompt` to the child's stdin and close it, and resolve
+ * with the trimmed stdout on exit code 0. Rejects with a useful Error on a
+ * non-zero exit (stderr tail included), on ENOENT ("command not found"), or
+ * after `timeoutMs` (the child is killed). `spawnImpl` is injectable for
  * tests.
+ *
+ * Obsidian is launched from the desktop, so the child would inherit a
+ * minimal PATH; the spawn extends it with the usual user-install directories
+ * (see extendedPath), and the settings UI suggests an absolute path if the
+ * CLI still is not found.
  */
 export async function runCliPrompt(
   command: string,
   prompt: string,
   spawnImpl?: SpawnImpl,
+  timeoutMs = CLI_TIMEOUT_MS,
 ): Promise<string> {
-  const argv = command.trim().split(/\s+/);
-  if (argv.length === 0 || !argv[0]) {
+  const argv = splitCommand(command);
+  if (argv.length === 0 || argv[0] === "") {
     throw new Error("CLI command is empty; set it in the plugin settings.");
   }
   const doSpawn: SpawnImpl =
     spawnImpl ??
-    ((file, args) => spawn(file, args) as unknown as CliChildProcess);
+    ((file, args) =>
+      spawn(file, args, {
+        env: { ...process.env, PATH: extendedPath(process.env) },
+      }));
   const child = doSpawn(argv[0], argv.slice(1));
 
   return new Promise<string>((resolve, reject) => {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let stdinError: Error | null = null;
+    const stdinNote = () =>
+      stdinError ? ` (stdin error: ${stdinError.message})` : "";
     const settle = (action: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       action();
     };
+    // Every settle() call site runs after this assignment: the listeners
+    // below fire asynchronously, and the synchronous !stdin branch is later.
     const timer = setTimeout(() => {
       child.kill();
       settle(() =>
-        reject(new Error(`CLI command timed out after 3 minutes: ${command}`)),
+        reject(
+          new Error(
+            `CLI command timed out after ${Math.ceil(timeoutMs / 1000)} s: ` +
+              command +
+              stdinNote(),
+          ),
+        ),
       );
-    }, CLI_TIMEOUT_MS);
+    }, timeoutMs);
 
+    // Decode as UTF-8 at the stream so a multi-byte character split across
+    // two chunks is not corrupted by string concatenation.
+    child.stdout?.setEncoding?.("utf8");
+    child.stderr?.setEncoding?.("utf8");
     child.stdout?.on("data", (chunk) => {
       stdout += chunk;
     });
@@ -230,36 +330,53 @@ export async function runCliPrompt(
     });
     child.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "ENOENT") {
-        settle(
-          () =>
-            reject(
-              new Error(
-                `command not found: \`${argv[0]}\` — install it or change ` +
-                  "the CLI command in settings",
-              ),
+        settle(() =>
+          reject(
+            new Error(
+              `command not found: \`${argv[0]}\`. Install it, or set an ` +
+                "absolute path to it as the CLI command in settings.",
             ),
+          ),
         );
       } else {
         settle(() => reject(err));
       }
     });
-    child.on("close", (code: number) => {
+    child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
       if (code === 0) {
         settle(() => resolve(stdout.trim()));
-      } else {
-        const tail = stderr
-          .trim()
-          .split("\n")
-          .slice(-5)
-          .join(" | ");
-        const suffix = tail ? `: ${tail}` : "";
-        settle(() =>
-          reject(new Error(`CLI command exited with code ${code}${suffix}`)),
-        );
+        return;
       }
+      const tail = stderr.trim().split("\n").slice(-5).join(" | ");
+      const suffix = tail ? `: ${tail}` : "";
+      const how =
+        code === null
+          ? `was killed by ${signal ?? "a signal"}`
+          : `exited with code ${code}`;
+      settle(() =>
+        reject(new Error(`CLI command ${how}${suffix}${stdinNote()}`)),
+      );
     });
 
-    child.write(prompt);
+    // Feed the prompt and close stdin so the CLI sees end-of-input; without
+    // the close, `claude -p` waits for more input until the timeout. A CLI
+    // that exits before reading everything raises EPIPE on stdin; a listener
+    // is required so it cannot surface as an unhandled stream error. The
+    // error is kept, not dropped: the close handler reports the exit code,
+    // and a timeout or failure message carries the stdin error with it.
+    const stdin = child.stdin;
+    if (!stdin) {
+      child.kill();
+      settle(() =>
+        reject(new Error("CLI child process exposes no stdin for the prompt.")),
+      );
+      return;
+    }
+    stdin.on("error", (err) => {
+      stdinError = err;
+    });
+    stdin.write(prompt);
+    stdin.end();
   });
 }
 

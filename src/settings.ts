@@ -184,8 +184,12 @@ export class TranscriberSettingTab extends PluginSettingTab {
         .setName("CLI command")
         .setDesc(
           "CLI backend: command that reads a prompt on stdin and prints the " +
-            "answer, e.g. `claude -p` or `codex exec`. Uses the CLI's own " +
-            "login — no API key is stored by the plugin.",
+            "answer, e.g. `claude -p` or `codex exec`. Common install " +
+            "locations (Homebrew, /usr/local/bin, ~/.local/bin, npm global) " +
+            "are searched even though Obsidian does not inherit your " +
+            "shell's PATH; if the command is still not found, give an " +
+            "absolute path and quote it if it contains spaces. Uses the " +
+            "CLI's own login — no API key is stored by the plugin.",
         )
         .addText((text) =>
           text

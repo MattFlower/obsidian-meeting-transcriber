@@ -36,7 +36,9 @@ interface Harness {
   panel: LiveRecordingPanel;
   setStatus: ReturnType<typeof vi.fn>;
   world: FakeWorld;
-  vault: { read: ReturnType<typeof vi.fn>; modify: ReturnType<typeof vi.fn> };
+  vault: { read: ReturnType<typeof vi.fn>; process: ReturnType<typeof vi.fn> };
+  /** Every note body written through vault.process, in order. */
+  written: string[];
   /** The panel's two buttons: start/stop and pause/resume. */
   buttons(): { startStop: FakeEl; pause: FakeEl };
   /** The owner tag the panel used for its status-bar line. */
@@ -51,9 +53,18 @@ interface HarnessOptions {
 function makeHarness(opts: HarnessOptions = {}): Harness {
   const registry = opts.registry ?? new LiveSessionRegistry();
   const world = makeWorld();
+  let current = "---\ntitle: live\n---\n\n## Transcript\n";
+  const written: string[] = [];
   const vault = {
-    read: vi.fn(async () => "---\ntitle: live\n---\n\n## Transcript\n"),
-    modify: vi.fn(async () => undefined),
+    read: vi.fn(async () => current),
+    // Obsidian's atomic read-modify-write: each callback sees the note as
+    // the previous write left it. The panel must use this rather than
+    // read() followed by modify(); the fake has no modify() at all.
+    process: vi.fn(async (_file: TFile, fn: (data: string) => string) => {
+      current = fn(current);
+      written.push(current);
+      return current;
+    }),
   };
   const setStatus = vi.fn();
   const host: LiveRecordingHost = {
@@ -85,6 +96,7 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     setStatus,
     world,
     vault,
+    written,
     buttons: () => {
       const [startStop, pause] = content.findAll((el) => el.tag === "button");
       return { startStop, pause };
@@ -141,8 +153,7 @@ describe("LiveRecordingPanel status bar", () => {
     h.buttons().startStop.click(); // now "Stop recording"
     await settle();
     expect(h.setStatus.mock.calls).toEqual([[owner, ""]]);
-    expect(h.vault.modify).toHaveBeenCalledWith(
-      expect.anything(),
+    expect(h.written).toContainEqual(
       expect.stringContaining("_No speech detected._"),
     );
 
@@ -248,11 +259,34 @@ describe("LiveRecordingPanel status bar", () => {
 
     finish("hello world");
     await settle();
-    expect(h.vault.modify).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.stringContaining("hello world"),
-    );
+    expect(h.written).toContainEqual(expect.stringContaining("hello world"));
     expect(h.setStatus).toHaveBeenLastCalledWith(owner, "● Live recording 00:00");
+  });
+
+  it("appends chunk text through vault.process, never read-then-modify", async () => {
+    transcribeMock.mockResolvedValueOnce("hello world");
+    const h = makeHarness();
+    await openAndStart(h);
+    feed(h.world.contexts[0], new Float32Array(16000 * 15));
+    await settle();
+    expect(h.vault.process).toHaveBeenCalledTimes(1);
+    expect(h.written[0]).toContain("hello world");
+    // A stale read() before the write is exactly what lost user edits.
+    expect(h.vault.read).not.toHaveBeenCalled();
+  });
+
+  it("accumulates successive chunks in the same note", async () => {
+    transcribeMock
+      .mockResolvedValueOnce("one two")
+      .mockResolvedValueOnce("three four");
+    const h = makeHarness();
+    await openAndStart(h);
+    feed(h.world.contexts[0], new Float32Array(16000 * 15));
+    await settle();
+    feed(h.world.contexts[0], new Float32Array(16000 * 15));
+    await settle();
+    expect(h.vault.process).toHaveBeenCalledTimes(2);
+    expect(h.written[1]).toContain("one two\n\nthree four");
   });
 
   it("refuses a second panel while another records, without touching the status bar", async () => {
@@ -296,8 +330,7 @@ describe("LiveRecordingPanel status bar", () => {
 
     // The late note is marked like any stopped session's, and no refresh or
     // status line is started for the dead session.
-    expect(h.vault.modify).toHaveBeenCalledWith(
-      expect.anything(),
+    expect(h.written).toContainEqual(
       expect.stringContaining("_No speech detected._"),
     );
     vi.advanceTimersByTime(5000);

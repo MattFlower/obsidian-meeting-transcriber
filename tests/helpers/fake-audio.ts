@@ -9,6 +9,7 @@ import type { LiveAudioContextLike, LiveCaptureDeps } from "../../src/live";
 
 export class FakeTrack {
   enabled = true;
+  readyState: "live" | "ended" = "live";
   stopped = false;
   onended: (() => void) | null = null;
   kind: string;

@@ -15,7 +15,12 @@ import {
   type TranscriberSettings,
 } from "./settings";
 import { decodeToMono16k, isAudioFile } from "./audio";
-import { modelFilePaths, releaseRecognizer, transcribe } from "./transcriber";
+import {
+  missingModelFiles,
+  missingModelFilesMessage,
+  releaseRecognizer,
+  transcribe,
+} from "./transcriber";
 import { downloadModel } from "./model-download";
 import { summarizeTranscript } from "./summarize";
 import {
@@ -65,6 +70,8 @@ export default class MeetingTranscriberPlugin extends Plugin {
   private downloadingModel = false;
   /** Plugin-wide coordination: at most one live recording session at a time. */
   private liveSessions = new LiveSessionRegistry();
+  /** Set at the start of onunload; pending live chunks are then skipped. */
+  private unloading = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -143,7 +150,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
     this.liveSessions.release(panel);
   }
 
+  isUnloading(): boolean {
+    return this.unloading;
+  }
+
   onunload(): void {
+    // Flag first: detaching the panel starts an asynchronous stop whose
+    // pending chunks must not rebuild the recognizer released below.
+    this.unloading = true;
     this.app.workspace.detachLeavesOfType(LIVE_PANEL_VIEW_TYPE);
     // Drop the cached Parakeet recognizer so its native memory can be
     // reclaimed once the plugin's references are gone.
@@ -189,12 +203,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     }
     const missing = this.findMissingModelFiles();
     if (missing.length > 0) {
-      new Notice(
-        "Parakeet model files are missing: " +
-          missing.join(", ") +
-          ". Run the 'Download Parakeet model' command first.",
-        15000,
-      );
+      new Notice(missingModelFilesMessage(missing), 15000);
       return;
     }
 
@@ -276,8 +285,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
   findMissingModelFiles(): string[] {
     const modelDirAbs = this.resolveModelDir();
     if (!modelDirAbs) return ["<non-desktop adapter>"];
-    const paths = modelFilePaths(modelDirAbs);
-    return (Object.values(paths) as string[]).filter((p) => !existsSync(p));
+    return missingModelFiles(modelDirAbs, existsSync);
   }
 
   private async createTranscriptionNote(
@@ -359,6 +367,9 @@ export default class MeetingTranscriberPlugin extends Plugin {
     const status = this.newStatusOwner("model-download");
     const notice = new Notice("Downloading Parakeet model (~600 MB)…");
     this.setStatus(status, "Downloading model…");
+    // The download overwrites the model files in place; a cached recognizer
+    // would keep serving the old weights, so drop it before writing.
+    releaseRecognizer();
     try {
       await downloadModel(destDir, (p) => {
         const pct =

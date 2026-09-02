@@ -417,6 +417,7 @@ registerProcessor(${JSON.stringify(CAPTURE_PROCESSOR_NAME)}, CaptureProcessor);
 
 export interface LiveMediaStreamTrackLike {
   enabled: boolean;
+  readonly readyState: "live" | "ended";
   stop(): void;
   onended: ((...args: unknown[]) => void) | null;
 }
@@ -455,16 +456,11 @@ export interface LiveCaptureDeps {
   enumerateDevices(): Promise<MediaDeviceInfo[]>;
   createAudioContext(sampleRate: number): LiveAudioContextLike;
   /**
-   * Register the capture worklet module (`source`, which calls
-   * `registerProcessor(processorName, …)`) in `context` and return a node
-   * for it. The node's port posts one `Float32Array` of mono samples per
-   * captured frame.
+   * Install the capture worklet (`CAPTURE_WORKLET_SOURCE`, registered as
+   * `CAPTURE_PROCESSOR_NAME`) in `context` and return a node for it. The
+   * node's port posts one `Float32Array` of mono samples per captured frame.
    */
-  createCaptureNode(
-    context: LiveAudioContextLike,
-    source: string,
-    processorName: string,
-  ): Promise<LiveCaptureNodeLike>;
+  createCaptureNode(context: LiveAudioContextLike): Promise<LiveCaptureNodeLike>;
 }
 
 export interface LiveRecordingSessionOptions {
@@ -502,6 +498,7 @@ export class LiveRecordingSession {
   private context: LiveAudioContextLike | null = null;
   private sourceNode: LiveAudioNodeLike | null = null;
   private captureNode: LiveCaptureNodeLike | null = null;
+  private starting = false;
   private recording = false;
   private paused = false;
   private startedAtMs = 0;
@@ -543,10 +540,23 @@ export class LiveRecordingSession {
    *   loopback device. The microphone is never used as a silent fallback.
    */
   async start(source: LiveAudioSource, deviceId?: string): Promise<void> {
-    if (this.recording) {
+    if (this.recording || this.starting) {
       throw new Error("A live recording session is already active.");
     }
+    // Set before the first await so a concurrent start() is refused while
+    // the stream and the capture graph are still being set up.
+    this.starting = true;
+    try {
+      await this.startCapture(source, deviceId);
+    } finally {
+      this.starting = false;
+    }
+  }
 
+  private async startCapture(
+    source: LiveAudioSource,
+    deviceId?: string,
+  ): Promise<void> {
     let stream: LiveMediaStreamLike;
     if (source === "system" && deviceId) {
       // A loopback input device is an ordinary audioinput on the OS.
@@ -587,15 +597,21 @@ export class LiveRecordingSession {
       });
     }
 
-    const context = this.deps.createAudioContext(this.sampleRate);
+    // The stream is live from here on. If the session cannot start, release
+    // it (so the OS recording indicator goes off) and whatever part of the
+    // graph exists, then fail with `reason`.
+    let context: LiveAudioContextLike | null = null;
+    const abort = async (reason: Error): Promise<never> => {
+      for (const track of stream.getTracks()) track.stop();
+      await context?.close().catch(() => undefined);
+      throw reason;
+    };
+
     let sourceNode: LiveAudioNodeLike;
     let captureNode: LiveCaptureNodeLike;
     try {
-      captureNode = await this.deps.createCaptureNode(
-        context,
-        CAPTURE_WORKLET_SOURCE,
-        CAPTURE_PROCESSOR_NAME,
-      );
+      context = this.deps.createAudioContext(this.sampleRate);
+      captureNode = await this.deps.createCaptureNode(context);
       captureNode.port.onmessage = (event) => {
         if (event.data instanceof Float32Array) this.handleFrame(event.data);
       };
@@ -605,11 +621,13 @@ export class LiveRecordingSession {
       // the processor writes no output, so nothing is audible.
       captureNode.connect(context.destination);
     } catch (e) {
-      // The stream is already live: release it so the OS recording
-      // indicator does not stay on for a session that never started.
-      for (const track of stream.getTracks()) track.stop();
-      await context.close().catch(() => undefined);
-      throw e;
+      return abort(e as Error);
+    }
+
+    // Installing the worklet is asynchronous; a track that ended meanwhile
+    // fired its one-shot `ended` event before any handler was attached.
+    if (stream.getAudioTracks().some((track) => track.readyState === "ended")) {
+      return abort(new Error("The audio input ended before recording started."));
     }
 
     // If the OS revokes the stream mid-session (e.g. device unplugged),

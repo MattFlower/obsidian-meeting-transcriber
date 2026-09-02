@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CAPTURE_FRAME_SAMPLES,
   CAPTURE_PROCESSOR_NAME,
@@ -11,7 +11,12 @@ import {
   type LiveSessionOwner,
   SYSTEM_AUDIO_UNAVAILABLE,
 } from "../src/live";
-import { feed, makeWorld, type FakeWorld } from "./helpers/fake-audio";
+import {
+  FakeAudioContext,
+  feed,
+  makeWorld,
+  type FakeWorld,
+} from "./helpers/fake-audio";
 
 function makeSession(
   world: FakeWorld,
@@ -442,15 +447,13 @@ describe("LiveRecordingSession", () => {
     expect(world.contexts[0].captureNode.connectCount).toBe(1);
   });
 
-  it("installs the capture worklet from the session's inline source", async () => {
+  it("installs the capture worklet in the session's audio context", async () => {
     const world = makeWorld();
     const session = makeSession(world);
     await session.start("microphone");
     expect(world.deps.createCaptureNode).toHaveBeenCalledTimes(1);
     expect(world.deps.createCaptureNode).toHaveBeenCalledWith(
       world.contexts[0],
-      CAPTURE_WORKLET_SOURCE,
-      CAPTURE_PROCESSOR_NAME,
     );
     await session.stop();
   });
@@ -460,6 +463,38 @@ describe("LiveRecordingSession", () => {
     const session = makeSession(world);
     await expect(session.start("microphone")).rejects.toThrow(
       /AudioWorklet unavailable/,
+    );
+    expect(world.micStream.tracks[0].stopped).toBe(true);
+    expect(world.contexts[0].closed).toBe(true);
+    expect(session.isRecording()).toBe(false);
+  });
+
+  it("stops the stream when the audio context cannot be created", async () => {
+    const world = makeWorld();
+    vi.mocked(world.deps.createAudioContext).mockImplementation(() => {
+      throw new Error("AudioContext unavailable");
+    });
+    const session = makeSession(world);
+    await expect(session.start("microphone")).rejects.toThrow(
+      /AudioContext unavailable/,
+    );
+    expect(world.micStream.tracks[0].stopped).toBe(true);
+    expect(world.deps.createCaptureNode).not.toHaveBeenCalled();
+    expect(session.isRecording()).toBe(false);
+  });
+
+  it("fails to start when the audio track ended while the worklet was loading", async () => {
+    const world = makeWorld();
+    vi.mocked(world.deps.createCaptureNode).mockImplementation(
+      async (context) => {
+        // The one-shot `ended` event fires during the asynchronous install.
+        world.micStream.tracks[0].readyState = "ended";
+        return (context as FakeAudioContext).captureNode;
+      },
+    );
+    const session = makeSession(world);
+    await expect(session.start("microphone")).rejects.toThrow(
+      /ended before recording started/,
     );
     expect(world.micStream.tracks[0].stopped).toBe(true);
     expect(world.contexts[0].closed).toBe(true);
@@ -658,6 +693,35 @@ describe("LiveRecordingSession", () => {
     await expect(session.start("microphone")).rejects.toThrow(
       /already active/i,
     );
+    await session.stop();
+  });
+
+  it("refuses a concurrent start() while the first is still setting up", async () => {
+    const world = makeWorld();
+    let finishWorklet!: () => void;
+    const workletReady = new Promise<void>((resolve) => {
+      finishWorklet = resolve;
+    });
+    vi.mocked(world.deps.createCaptureNode).mockImplementation(
+      async (context) => {
+        await workletReady;
+        return (context as FakeAudioContext).captureNode;
+      },
+    );
+    const session = makeSession(world);
+    const first = session.start("microphone");
+    await expect(session.start("microphone")).rejects.toThrow(
+      /already active/i,
+    );
+    finishWorklet();
+    await first;
+    expect(session.isRecording()).toBe(true);
+    expect(world.deps.getUserMedia).toHaveBeenCalledTimes(1);
+    expect(world.contexts).toHaveLength(1);
+    await session.stop();
+    // The flag is cleared on completion, so a fresh start works again.
+    await session.start("microphone");
+    expect(session.isRecording()).toBe(true);
     await session.stop();
   });
 

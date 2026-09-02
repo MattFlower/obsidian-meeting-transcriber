@@ -10,9 +10,11 @@ import * as path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   MODEL_FILE_NAMES,
+  ModelFilesMissingError,
   buildRecognizerConfig,
   loadSherpaOnnx,
   missingModelFiles,
+  missingModelFilesMessage,
   modelFilePaths,
   releaseRecognizer,
   transcribe,
@@ -174,13 +176,19 @@ describe("transcribe with the plugin-directory recognizer", () => {
     expect(loadSherpaOnnx(pluginDir).counts().createdAsync).toBe(2);
   });
 
-  it("rejects and drops the cache when a model file goes missing", async () => {
+  it("rejects with ModelFilesMissingError and drops the cache when a model file goes missing", async () => {
     await transcribe(pcm, modelDir, pluginDir);
     const tokens = path.join(modelDir, MODEL_FILE_NAMES.tokens);
     unlinkSync(tokens);
     try {
-      await expect(transcribe(pcm, modelDir, pluginDir)).rejects.toThrow(
-        /missing: .*tokens\.txt/,
+      const failure = transcribe(pcm, modelDir, pluginDir);
+      await expect(failure).rejects.toBeInstanceOf(ModelFilesMissingError);
+      await expect(failure).rejects.toMatchObject({
+        missing: [`${modelDir}/tokens.txt`],
+      });
+      // The message carries the download hint, so callers can show it as is.
+      await expect(failure).rejects.toThrow(
+        /missing: .*tokens\.txt\. Run the 'Download Parakeet model' command first\./,
       );
     } finally {
       writeFileSync(tokens, "");
@@ -241,6 +249,15 @@ describe("buildRecognizerConfig", () => {
       const base = p.split("/").pop() as string;
       expect(Object.values(MODEL_FILE_NAMES)).toContain(base);
     }
+  });
+});
+
+describe("missingModelFilesMessage", () => {
+  it("lists the files and points at the download command", () => {
+    expect(missingModelFilesMessage(["m/a.onnx", "m/tokens.txt"])).toBe(
+      "Parakeet model files are missing: m/a.onnx, m/tokens.txt. " +
+        "Run the 'Download Parakeet model' command first.",
+    );
   });
 });
 

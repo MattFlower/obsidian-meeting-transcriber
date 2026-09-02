@@ -127,11 +127,35 @@ interface RecognizerHolder {
   recognizer: Promise<OfflineRecognizerLike>;
 }
 
+/** The one wording for a missing-model-files notice or error. */
+export function missingModelFilesMessage(missing: string[]): string {
+  return (
+    "Parakeet model files are missing: " +
+    missing.join(", ") +
+    ". Run the 'Download Parakeet model' command first."
+  );
+}
+
+/**
+ * Thrown when the model directory lacks one or more of the expected files.
+ * The message already carries the user-facing guidance, so callers can show
+ * it as is; `missing` lists the absent paths.
+ */
+export class ModelFilesMissingError extends Error {
+  readonly missing: string[];
+
+  constructor(missing: string[]) {
+    super(missingModelFilesMessage(missing));
+    this.name = "ModelFilesMissingError";
+    this.missing = missing;
+  }
+}
+
 /**
  * The single process-wide recognizer. Loading the three ONNX models takes
  * seconds and hundreds of MB of native memory, so it is created once and
  * shared; sherpa-onnx's offline recognizer may be used from several callers
- * at once as long as each decode uses its own stream.
+ * at once (CPU provider) as long as each decode uses its own stream.
  */
 let holder: RecognizerHolder | null = null;
 
@@ -153,36 +177,36 @@ function recognizerKey(modelDir: string, pluginDir: string): string {
 export async function getRecognizer(
   modelDir: string,
   pluginDir: string,
-  exists: (path: string) => boolean = existsSync,
 ): Promise<OfflineRecognizerLike> {
-  const missing = missingModelFiles(modelDir, exists);
+  const missing = missingModelFiles(modelDir, existsSync);
   if (missing.length > 0) {
     holder = null;
-    throw new Error(`Parakeet model files are missing: ${missing.join(", ")}`);
+    throw new ModelFilesMissingError(missing);
   }
 
   const key = recognizerKey(modelDir, pluginDir);
-  let entry = holder;
-  if (entry === null || entry.key !== key) {
+  if (holder === null || holder.key !== key) {
     const sherpa = loadSherpaOnnx(pluginDir);
     const recognizer: Promise<OfflineRecognizerLike> =
       sherpa.OfflineRecognizer.createAsync(buildRecognizerConfig(modelDir));
-    const created: RecognizerHolder = { key, recognizer };
-    holder = created;
+    holder = { key, recognizer };
     recognizer.catch(() => {
-      if (holder === created) holder = null;
+      // Forget a failed creation so the next call retries, unless a newer
+      // holder has replaced it meanwhile.
+      if (holder?.recognizer === recognizer) holder = null;
     });
-    entry = created;
   }
-  return entry.recognizer;
+  return holder.recognizer;
 }
 
 /**
  * Drop the cached recognizer. sherpa-onnx-node exposes no dispose(), so the
  * native memory is reclaimed when the addon finalizes the handle after GC;
  * dropping the only long-lived JS reference is all a caller can do. Used on
- * plugin unload and when the model directory setting changes. A transcribe()
- * already in flight keeps its own reference until its decode completes.
+ * plugin unload and before a model download overwrites the files in place
+ * (the cache key cannot tell new files from old). A decode already in flight
+ * is unaffected: the wrapper's pending promise keeps the native handles
+ * alive until it settles.
  */
 export function releaseRecognizer(): void {
   holder = null;

@@ -1,6 +1,8 @@
 import { ItemView, Notice, TFile, WorkspaceLeaf } from "obsidian";
 
 import {
+  CAPTURE_PROCESSOR_NAME,
+  CAPTURE_WORKLET_SOURCE,
   LiveAudioSource,
   LiveCaptureDeps,
   LiveRecordingSession,
@@ -10,7 +12,7 @@ import {
   type TranscriptWordCorrection,
 } from "./live";
 import { appendToTranscriptSection } from "./note";
-import { transcribe } from "./transcriber";
+import { missingModelFilesMessage, transcribe } from "./transcriber";
 import type { TranscriberSettings } from "./settings";
 
 /**
@@ -42,6 +44,8 @@ export interface LiveRecordingHost {
   claimLiveSession(panel: LiveRecordingPanel): boolean;
   /** Release the slot (no-op if this panel no longer holds it). */
   releaseLiveSession(panel: LiveRecordingPanel): void;
+  /** True once the plugin has begun unloading; pending chunks are skipped. */
+  isUnloading(): boolean;
 }
 
 function clampChunkSeconds(value: number): number {
@@ -57,8 +61,8 @@ function browserCaptureDeps(): LiveCaptureDeps {
     getDisplayMedia: (constraints) => md.getDisplayMedia(constraints),
     enumerateDevices: () => md.enumerateDevices(),
     createAudioContext: (sampleRate) => new AudioContext({ sampleRate }),
-    createCaptureNode: (context, source, processorName) =>
-      createWorkletCaptureNode(context as AudioContext, source, processorName),
+    createCaptureNode: (context) =>
+      createWorkletCaptureNode(context as AudioContext),
   };
 }
 
@@ -106,18 +110,22 @@ function correctTranscriptWord(
  */
 async function createWorkletCaptureNode(
   context: AudioContext,
-  source: string,
-  processorName: string,
 ): Promise<AudioWorkletNode> {
   const url = URL.createObjectURL(
-    new Blob([source], { type: "application/javascript" }),
+    new Blob([CAPTURE_WORKLET_SOURCE], { type: "application/javascript" }),
   );
   try {
     await context.audioWorklet.addModule(url);
+  } catch (e) {
+    // Chromium reports any module fetch or evaluation failure as a bare
+    // AbortError; name the component so the notice is actionable.
+    throw new Error(
+      `Could not load the capture AudioWorklet: ${(e as Error).message}`,
+    );
   } finally {
     URL.revokeObjectURL(url);
   }
-  return new AudioWorkletNode(context, processorName, {
+  return new AudioWorkletNode(context, CAPTURE_PROCESSOR_NAME, {
     numberOfInputs: 1,
     numberOfOutputs: 1,
     channelCount: 1,
@@ -431,12 +439,7 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     }
     const missing = this.host.findMissingModelFiles();
     if (missing.length > 0) {
-      new Notice(
-        "Parakeet model files are missing: " +
-          missing.join(", ") +
-          ". Run the 'Download Parakeet model' command first.",
-        15000,
-      );
+      new Notice(missingModelFilesMessage(missing), 15000);
       return;
     }
 
@@ -560,7 +563,9 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     const modelDir = this.host.resolveModelDir();
     const pluginDir = this.host.resolvePluginDir();
     const note = this.note;
-    if (!modelDir || !pluginDir || !note) return;
+    // Once the plugin is unloading, the recognizer has been released; a
+    // pending chunk must not rebuild it in a dead plugin.
+    if (!modelDir || !pluginDir || !note || this.host.isUnloading()) return;
     this.transcribing = true;
     this.updateStatus();
     this.mirrorToStatusBar();

@@ -13,7 +13,10 @@ import {
 
 // Chunk transcription goes through the native sherpa-onnx addon; stub it so
 // the test stays headless and can hold a chunk "in flight".
-vi.mock("../src/transcriber", () => ({ transcribe: vi.fn() }));
+vi.mock("../src/transcriber", () => ({
+  transcribe: vi.fn(),
+  missingModelFilesMessage: vi.fn((missing: string[]) => missing.join(", ")),
+}));
 
 import { transcribe } from "../src/transcriber";
 import { LiveRecordingPanel, type LiveRecordingHost } from "../src/live-panel";
@@ -68,6 +71,7 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     isLiveSessionActive: () => registry.isRecording(),
     claimLiveSession: (panel) => registry.tryClaim(panel),
     releaseLiveSession: (panel) => registry.release(panel),
+    isUnloading: () => false,
   };
   const leaf = new WorkspaceLeaf({ vault });
   const panel = new LiveRecordingPanel(

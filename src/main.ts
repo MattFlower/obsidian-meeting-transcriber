@@ -20,6 +20,8 @@ import { downloadModel } from "./model-download";
 import { summarizeTranscript } from "./summarize";
 import {
   applySummaryToBody,
+  formatLocalDate,
+  formatLocalTime,
   mergeSummaryIntoFrontmatter,
   noteFileName,
   transcriptionNoteContent,
@@ -29,6 +31,7 @@ import {
   LIVE_PANEL_VIEW_TYPE,
 } from "./live-panel";
 import { LiveSessionRegistry } from "./live";
+import { StatusBoard } from "./status";
 
 /**
  * Meeting Transcriber
@@ -49,7 +52,17 @@ import { LiveSessionRegistry } from "./live";
  */
 export default class MeetingTranscriberPlugin extends Plugin {
   settings: TranscriberSettings = DEFAULT_SETTINGS;
-  private statusBarItem: HTMLElement | null = null;
+  /**
+   * Owner-tagged lines behind the single status bar item, so concurrent
+   * activities (file transcription, model download, live recording) never
+   * overwrite each other's progress text. Created in onload() once the
+   * status bar item exists, so nothing is recorded as shown before it can
+   * actually be rendered.
+   */
+  private status: StatusBoard | null = null;
+  /** Owner tags are per invocation, so concurrent runs never share a line. */
+  private statusSequence = 0;
+  private downloadingModel = false;
   /** Plugin-wide coordination: at most one live recording session at a time. */
   private liveSessions = new LiveSessionRegistry();
 
@@ -57,8 +70,8 @@ export default class MeetingTranscriberPlugin extends Plugin {
     await this.loadSettings();
     this.addSettingTab(new TranscriberSettingTab(this.app, this));
 
-    this.statusBarItem = this.addStatusBarItem();
-    this.setStatus("");
+    const statusBarItem = this.addStatusBarItem();
+    this.status = new StatusBoard((text) => statusBarItem.setText(text));
 
     this.registerView(
       LIVE_PANEL_VIEW_TYPE,
@@ -143,10 +156,18 @@ export default class MeetingTranscriberPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
-  setStatus(text: string): void {
-    if (this.statusBarItem) {
-      this.statusBarItem.setText(text);
-    }
+  /**
+   * Set one activity's line on the shared status bar, or clear it with an
+   * empty string. `owner` tags the line so a live recording refreshing its
+   * clock cannot erase a file transcription's "Transcribing…" (or vice
+   * versa); the bar shows every active owner's text.
+   */
+  setStatus(owner: string, text: string): void {
+    this.status?.set(owner, text);
+  }
+
+  private newStatusOwner(kind: string): string {
+    return `${kind}-${++this.statusSequence}`;
   }
 
   // ---------------------------------------------------------------------
@@ -174,8 +195,9 @@ export default class MeetingTranscriberPlugin extends Plugin {
       return;
     }
 
+    const status = this.newStatusOwner("transcribe");
     const notice = new Notice("Decoding audio…");
-    this.setStatus("Decoding audio…");
+    this.setStatus(status, "Decoding audio…");
     let samples: Float32Array;
     try {
       const arrayBuffer = await this.app.vault.adapter.readBinary(file.path);
@@ -191,7 +213,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
       }
     } catch (e) {
       notice.hide();
-      this.setStatus("");
+      this.setStatus(status, "");
       new Notice(
         `Could not decode ${file.name}: ${(e as Error).message}`,
         10000,
@@ -200,7 +222,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     }
     notice.hide();
 
-    this.setStatus("Transcribing (this can take a while)…");
+    this.setStatus(status, "Transcribing (this can take a while)…");
     const progress = new Notice("Transcribing… this can take a few minutes.");
     try {
       const text = await transcribe(samples, modelDirAbs, pluginDir);
@@ -217,7 +239,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
       );
     } finally {
       progress.hide();
-      this.setStatus("");
+      this.setStatus(status, "");
     }
   }
 
@@ -291,10 +313,12 @@ export default class MeetingTranscriberPlugin extends Plugin {
     const dir = folder ? `${folder}/` : "";
     const notePath = `${dir}${fileName}`;
 
-    const title = `${now.toISOString().slice(0, 10)} ${baseName}`;
+    // Title, frontmatter date, and file name all use local time so they agree
+    // on the calendar day; toISOString() is UTC and can already be tomorrow.
+    const title = `${formatLocalDate(now)} ${baseName}`;
     const content = transcriptionNoteContent({
       title,
-      date: now.toISOString().slice(0, 16).replace("T", " "),
+      date: `${formatLocalDate(now)} ${formatLocalTime(now)}`,
       audioLink: sourceLabel,
       transcript,
       tags: [...this.settings.defaultTags],
@@ -315,6 +339,11 @@ export default class MeetingTranscriberPlugin extends Plugin {
   // ---------------------------------------------------------------------
 
   private async downloadModelFiles(): Promise<void> {
+    // Two downloads would stream into the same model files.
+    if (this.downloadingModel) {
+      new Notice("A model download is already in progress.", 8000);
+      return;
+    }
     const destDir = this.resolveModelDir();
     if (!destDir) {
       new Notice(
@@ -323,8 +352,10 @@ export default class MeetingTranscriberPlugin extends Plugin {
       );
       return;
     }
+    this.downloadingModel = true;
+    const status = this.newStatusOwner("model-download");
     const notice = new Notice("Downloading Parakeet model (~600 MB)…");
-    this.setStatus("Downloading model…");
+    this.setStatus(status, "Downloading model…");
     try {
       await downloadModel(destDir, (p) => {
         const pct =
@@ -334,13 +365,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
         notice.messageEl.setText(
           `Downloading ${p.file}${pct} [${p.index + 1}/${p.count}]`,
         );
-        this.setStatus(`Model ${p.index + 1}/${p.count}: ${p.file}`);
+        this.setStatus(status, `Model ${p.index + 1}/${p.count}: ${p.file}`);
       });
       new Notice("Parakeet model downloaded.", 8000);
     } catch (e) {
       new Notice(`Model download failed: ${(e as Error).message}`, 15000);
     } finally {
-      this.setStatus("");
+      this.downloadingModel = false;
+      this.setStatus(status, "");
     }
   }
 
@@ -387,8 +419,9 @@ export default class MeetingTranscriberPlugin extends Plugin {
       return;
     }
 
+    const status = this.newStatusOwner("summarize");
     const notice = new Notice("Summarizing…");
-    this.setStatus("Summarizing…");
+    this.setStatus(status, "Summarizing…");
     try {
       const content = await this.app.vault.read(file);
       const transcript = extractTranscript(content) || content;
@@ -410,7 +443,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
       new Notice(`Summarize failed: ${(e as Error).message}`, 15000);
     } finally {
       notice.hide();
-      this.setStatus("");
+      this.setStatus(status, "");
     }
   }
 }

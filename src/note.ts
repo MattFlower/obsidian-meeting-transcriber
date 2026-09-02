@@ -359,16 +359,32 @@ export function sanitizeFileName(name: string): string {
   return cleaned || "untitled";
 }
 
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+/** Local calendar date as `YYYY-MM-DD`. */
+export function formatLocalDate(date: Date): string {
+  const year = date.getFullYear();
+  return `${year}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
 /**
- * Build a note file name of the form `YYYY-MM-DD HHmm <name>.md`.
- * `audioBaseName` should be the audio file name without its extension.
+ * Local wall-clock time as `HH:MM`, or `HHmm` with an empty `separator`
+ * (the file-name stamp).
+ */
+export function formatLocalTime(date: Date, separator = ":"): string {
+  return `${pad2(date.getHours())}${separator}${pad2(date.getMinutes())}`;
+}
+
+/**
+ * Build a note file name of the form `YYYY-MM-DD HHmm <name>.md`, stamped in
+ * local time. `audioBaseName` should be the audio file name without its
+ * extension. The note title and `date` frontmatter are built from the same
+ * two formatters so all three agree on the calendar day: an ISO/UTC stamp can
+ * already be on the next day while the local file name is not.
  */
 export function noteFileName(date: Date, audioBaseName: string): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  const hh = String(date.getHours()).padStart(2, "0");
-  const mm = String(date.getMinutes()).padStart(2, "0");
-  const stamp = `${y}-${m}-${d} ${hh}${mm}`;
+  const stamp = `${formatLocalDate(date)} ${formatLocalTime(date, "")}`;
   return `${stamp} ${sanitizeFileName(audioBaseName)}.md`;
 }

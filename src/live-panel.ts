@@ -27,7 +27,12 @@ export interface LiveRecordingHost {
     sourceLabel: string,
     transcript: string,
   ): Promise<TFile>;
-  setStatus(text: string): void;
+  /**
+   * Set (or clear with "") this owner's line on the shared status bar. The
+   * plugin merges lines from concurrent activities, so the panel only ever
+   * writes its own.
+   */
+  setStatus(owner: string, text: string): void;
   /** True when any live recording session in the plugin is active. */
   isLiveSessionActive(): boolean;
   /**
@@ -42,6 +47,17 @@ export interface LiveRecordingHost {
 function clampChunkSeconds(value: number): number {
   if (!Number.isFinite(value)) return 15;
   return Math.min(60, Math.max(5, Math.round(value)));
+}
+
+/** Capture factories over the browser's media devices (production wiring). */
+function browserCaptureDeps(): LiveCaptureDeps {
+  const md = navigator.mediaDevices;
+  return {
+    getUserMedia: (constraints) => md.getUserMedia(constraints),
+    getDisplayMedia: (constraints) => md.getDisplayMedia(constraints),
+    enumerateDevices: () => md.enumerateDevices(),
+    createAudioContext: (sampleRate) => new AudioContext({ sampleRate }),
+  };
 }
 
 function formatClock(totalSeconds: number): string {
@@ -81,6 +97,9 @@ function correctTranscriptWord(
 
 export const LIVE_PANEL_VIEW_TYPE = "meeting-transcriber-live";
 
+/** Gives each panel its own status-bar owner tag. */
+let panelSequence = 0;
+
 /**
  * Dockable control panel for live meeting recording: pick the audio source
  * (microphone or system audio) and input device, start/stop the session,
@@ -90,6 +109,8 @@ export const LIVE_PANEL_VIEW_TYPE = "meeting-transcriber-live";
 export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
   private readonly host: LiveRecordingHost;
   private readonly deps: LiveCaptureDeps;
+  /** Owner tag for this panel's line on the shared status bar. */
+  private readonly statusOwner: string;
   private readonly session: LiveRecordingSession;
   private readonly deduper = new TranscriptOverlapDeduper();
 
@@ -109,17 +130,19 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
   private startPending = false;
   private closed = false;
 
-  constructor(leaf: WorkspaceLeaf, host: LiveRecordingHost) {
+  /**
+   * `deps` defaults to the browser's media devices; tests inject fakes so the
+   * panel runs headless.
+   */
+  constructor(
+    leaf: WorkspaceLeaf,
+    host: LiveRecordingHost,
+    deps: LiveCaptureDeps = browserCaptureDeps(),
+  ) {
     super(leaf);
     this.host = host;
-    const md = navigator.mediaDevices;
-    this.deps = {
-      getUserMedia: (constraints) => md.getUserMedia(constraints),
-      getDisplayMedia: (constraints) => md.getDisplayMedia(constraints),
-      enumerateDevices: () => md.enumerateDevices(),
-      createAudioContext: (sampleRate) =>
-        new AudioContext({ sampleRate }),
-    };
+    this.deps = deps;
+    this.statusOwner = `live-panel-${++panelSequence}`;
     this.session = new LiveRecordingSession(this.deps, {
       chunkSeconds: clampChunkSeconds(host.settings.liveChunkSeconds),
       onChunk: (pcm) => {
@@ -155,15 +178,11 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     this.buildContent();
     void this.refreshDevices();
     this.updateStatus();
-    this.timer = window.setInterval(() => this.tick(), 1000);
   }
 
   async onClose(): Promise<void> {
     this.closed = true;
-    if (this.timer !== null) {
-      window.clearInterval(this.timer);
-      this.timer = null;
-    }
+    this.stopTicking();
     // Closing the panel while recording ends the session (flush + final
     // transcribe) rather than dropping the tail of the meeting. A pending
     // permission request keeps its claim until startSession() settles, so no
@@ -244,6 +263,23 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     this.updateStatus();
   }
 
+  /**
+   * The one-second refresh runs only while this panel owns a session: it
+   * advances the elapsed clock in the panel and mirrors it to the status
+   * bar. An idle panel never touches the status bar, so it cannot erase
+   * progress text written by a file transcription or a model download.
+   */
+  private startTicking(): void {
+    if (this.timer !== null) return;
+    this.timer = window.setInterval(() => this.tick(), 1000);
+  }
+
+  private stopTicking(): void {
+    if (this.timer === null) return;
+    window.clearInterval(this.timer);
+    this.timer = null;
+  }
+
   private tick(): void {
     this.updateStatus();
     this.mirrorToStatusBar();
@@ -268,17 +304,18 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     }
   }
 
+  /** Push this panel's line to the shared status bar ("" clears it). */
   private mirrorToStatusBar(): void {
-    if (this.session.isRecording()) {
-      const t = formatClock(this.session.elapsedSeconds());
-      this.host.setStatus(
-        this.session.isPaused()
-          ? `⏸ Live paused ${t}`
-          : `● Live recording ${t}`,
-      );
-    } else {
-      this.host.setStatus("");
-    }
+    this.host.setStatus(this.statusOwner, this.statusBarText());
+  }
+
+  private statusBarText(): string {
+    if (!this.transcribing && !this.session.isRecording()) return "";
+    const t = formatClock(this.session.elapsedSeconds());
+    if (this.transcribing) return `● Live: transcribing chunk… ${t}`;
+    return this.session.isPaused()
+      ? `⏸ Live paused ${t}`
+      : `● Live recording ${t}`;
   }
 
   private setButtonsForState(): void {
@@ -403,8 +440,9 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
       return;
     }
 
+    let note: TFile;
     try {
-      this.note = await this.host.createNote(
+      note = await this.host.createNote(
         `Live recording (${source})`,
         `live-${source}`,
         "",
@@ -416,12 +454,23 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
       return;
     }
 
+    // The session may have ended while the note was being created (panel
+    // closed, input ended, Stop clicked); stopSession() already tore it
+    // down, so do not resurrect it — just leave the note marked the way a
+    // stopped session's would be.
+    if (this.closed || !this.session.isRecording()) {
+      await this.markNoSpeech(note);
+      return;
+    }
+
+    this.note = note;
     this.producedText = false;
     this.pump = Promise.resolve();
     this.deduper.reset();
     this.setButtonsForState();
     this.updateStatus();
     this.mirrorToStatusBar();
+    this.startTicking();
   }
 
   private async stopSession(): Promise<void> {
@@ -441,18 +490,10 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
         await this.pump;
       }
       if (this.note && !this.producedText) {
-        const note = this.note;
-        try {
-          const content = await this.app.vault.read(note);
-          await this.app.vault.modify(
-            note,
-            appendToTranscriptSection(content, "_No speech detected._"),
-          );
-        } catch {
-          // The note may have been deleted or renamed meanwhile.
-        }
+        await this.markNoSpeech(this.note);
       }
     } finally {
+      this.stopTicking();
       this.stopping = false;
       this.note = null;
       this.transcribing = false;
@@ -464,6 +505,19 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     }
   }
 
+  /** Record in the note that the session produced no transcript text. */
+  private async markNoSpeech(note: TFile): Promise<void> {
+    try {
+      const content = await this.app.vault.read(note);
+      await this.app.vault.modify(
+        note,
+        appendToTranscriptSection(content, "_No speech detected._"),
+      );
+    } catch {
+      // The note may have been deleted or renamed meanwhile.
+    }
+  }
+
   private async transcribeChunk(pcm: Float32Array): Promise<void> {
     const modelDir = this.host.resolveModelDir();
     const pluginDir = this.host.resolvePluginDir();
@@ -471,7 +525,7 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     if (!modelDir || !pluginDir || !note) return;
     this.transcribing = true;
     this.updateStatus();
-    this.host.setStatus("● Live: transcribing chunk…");
+    this.mirrorToStatusBar();
     try {
       const text = await transcribe(pcm, modelDir, pluginDir);
       if (text) {

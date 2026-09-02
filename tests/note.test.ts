@@ -4,6 +4,8 @@ import {
   applySummary,
   applySummaryToBody,
   emitFrontmatter,
+  formatLocalDate,
+  formatLocalTime,
   insertSummarySection,
   mergeSummaryIntoFrontmatter,
   noteFileName,
@@ -360,5 +362,26 @@ describe("noteFileName", () => {
   it("sanitizes the base name", () => {
     const date = new Date(2026, 0, 2, 9, 7);
     expect(noteFileName(date, 'a/b:c')).toBe("2026-01-02 0907 a-b-c.md");
+  });
+});
+
+describe("local time formatters", () => {
+  it("formatLocalDate / formatLocalTime use zero-padded local components", () => {
+    const date = new Date(2026, 8, 1, 21, 30);
+    expect(formatLocalDate(date)).toBe("2026-09-01");
+    expect(formatLocalTime(date)).toBe("21:30");
+    expect(formatLocalTime(date, "")).toBe("2130");
+  });
+
+  it("file name, title date, and frontmatter date agree on the day near midnight", () => {
+    // Local 23:59 is already the next day in UTC for anyone west of Greenwich;
+    // all three stamps come from the same local-time formatters.
+    const date = new Date(2026, 8, 1, 23, 59);
+    const fileName = noteFileName(date, "late meeting");
+    expect(fileName).toBe("2026-09-01 2359 late meeting.md");
+    expect(fileName.startsWith(formatLocalDate(date))).toBe(true);
+    expect(`${formatLocalDate(date)} ${formatLocalTime(date)}`).toBe(
+      "2026-09-01 23:59",
+    );
   });
 });

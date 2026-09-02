@@ -1,139 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   LIVE_SAMPLE_RATE,
   LiveChunker,
   LiveRecordingSession,
   LiveSessionRegistry,
   TranscriptOverlapDeduper,
-  type LiveCaptureDeps,
   type LiveSessionOwner,
   SYSTEM_AUDIO_UNAVAILABLE,
 } from "../src/live";
-
-// ---------------------------------------------------------------------------
-// Fakes for the Web Audio / MediaStream surface (headless: no DOM).
-// ---------------------------------------------------------------------------
-
-class FakeTrack {
-  enabled = true;
-  stopped = false;
-  onended: (() => void) | null = null;
-  kind: string;
-
-  constructor(kind: string) {
-    this.kind = kind;
-  }
-
-  stop(): void {
-    this.stopped = true;
-  }
-}
-
-class FakeStream {
-  tracks: FakeTrack[];
-
-  constructor(tracks: FakeTrack[] = []) {
-    this.tracks = tracks;
-  }
-
-  getTracks(): FakeTrack[] {
-    return this.tracks;
-  }
-
-  getAudioTracks(): FakeTrack[] {
-    return this.tracks.filter((t) => t.kind === "audio");
-  }
-
-  getVideoTracks(): FakeTrack[] {
-    return this.tracks.filter((t) => t.kind === "video");
-  }
-}
-
-class FakeScriptProcessor {
-  onaudioprocess:
-    | ((e: { inputBuffer: { getChannelData(c: number): Float32Array } }) => void)
-    | null = null;
-  connectCount = 0;
-  disconnectCount = 0;
-
-  connect(): void {
-    this.connectCount++;
-  }
-
-  disconnect(): void {
-    this.disconnectCount++;
-  }
-}
-
-class FakeSourceNode {
-  connectCount = 0;
-
-  connect(): void {
-    this.connectCount++;
-  }
-
-  disconnect(): void {
-    // no-op
-  }
-}
-
-class FakeAudioContext {
-  sampleRate: number;
-  processor = new FakeScriptProcessor();
-  sourceNode = new FakeSourceNode();
-  closed = false;
-  destination = {};
-
-  constructor(sampleRate: number) {
-    this.sampleRate = sampleRate;
-  }
-
-  createMediaStreamSource(_stream: unknown): FakeSourceNode {
-    return this.sourceNode;
-  }
-
-  createScriptProcessor(): FakeScriptProcessor {
-    return this.processor;
-  }
-
-  async close(): Promise<void> {
-    this.closed = true;
-  }
-}
-
-interface FakeWorld {
-  deps: LiveCaptureDeps;
-  micStream: FakeStream;
-  displayStream: FakeStream;
-  contexts: FakeAudioContext[];
-}
-
-function makeWorld(opts?: {
-  displayAudio?: boolean;
-  displayThrows?: boolean;
-}): FakeWorld {
-  const micStream = new FakeStream([new FakeTrack("audio")]);
-  const displayStream = new FakeStream([
-    new FakeTrack("video"),
-    ...(opts?.displayAudio === false ? [] : [new FakeTrack("audio")]),
-  ]);
-  const contexts: FakeAudioContext[] = [];
-  const deps: LiveCaptureDeps = {
-    getUserMedia: vi.fn(async () => micStream),
-    getDisplayMedia: opts?.displayThrows
-      ? vi.fn(async () => {
-          throw new Error("Permission denied");
-        })
-      : vi.fn(async () => displayStream),
-    enumerateDevices: vi.fn(async () => []),
-    createAudioContext: vi.fn((rate: number) => {
-      const ctx = new FakeAudioContext(rate);
-      contexts.push(ctx);
-      return ctx;
-    }),
-  };
-  return { deps, micStream, displayStream, contexts };
-}
+import { feed, makeWorld, type FakeWorld } from "./helpers/fake-audio";
 
 function makeSession(
   world: FakeWorld,
@@ -155,12 +30,6 @@ function makeSession(
     onChunk: overrides?.onChunk ?? ((pcm) => chunks.push(pcm)),
     onError: overrides?.onError ?? ((e) => errors.push(e)),
     clock: overrides?.clock,
-  });
-}
-
-function feed(ctx: FakeAudioContext, samples: Float32Array): void {
-  ctx.processor.onaudioprocess!({
-    inputBuffer: { getChannelData: () => samples },
   });
 }
 

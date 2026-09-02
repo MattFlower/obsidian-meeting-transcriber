@@ -105,6 +105,205 @@ describe("TranscriptOverlapDeduper", () => {
     expect(deduper.append("")).toBe("");
     expect(deduper.append("seam continues")).toBe("continues");
   });
+
+  it.each([
+    ["we saw a", "and then we left"],
+    ["I went to the", "then the store closed"],
+    ["she said I", "It was fine"],
+    ["meet me in", "into the room"],
+    ["please do", "don't forget"],
+  ])(
+    "keeps a short real seam word instead of treating it as clipped: %j + %j",
+    (first, second) => {
+      const deduper = new TranscriptOverlapDeduper();
+      const emittedFirst = deduper.append(first);
+      const emittedSecond = deduper.append(second);
+
+      expect(deduper.takeCorrection()).toBeNull();
+      expect(emittedSecond).toBe(second);
+      expect(`${emittedFirst} ${emittedSecond}`).toBe(`${first} ${second}`);
+    },
+  );
+
+  it("keeps a complete short word that merely prefixes the next chunk's first word", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("we went with");
+    expect(deduper.append("without the others")).toBe("without the others");
+    expect(deduper.takeCorrection()).toBeNull();
+  });
+
+  it("corrects a short clipped word when an exact-match word anchors the seam", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("we saw a");
+    const second = deduper.append("saw and then we left");
+
+    expect(deduper.takeCorrection()).toEqual({
+      previous: "a",
+      replacement: "and",
+    });
+    expect(second).toBe("then we left");
+  });
+
+  it("drops the clipped word's chunk-final punctuation when the next chunk continues", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("we discussed transcri.");
+    expect(deduper.append("discussed transcription of the meeting")).toBe(
+      "of the meeting",
+    );
+    expect(deduper.takeCorrection()).toEqual({
+      previous: "transcri.",
+      replacement: "transcription",
+    });
+  });
+
+  it("keeps the clipped word's sentence punctuation when nothing follows the fuller word", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("we discussed transcri.");
+    expect(deduper.append("discussed transcription")).toBe("");
+    expect(deduper.takeCorrection()).toEqual({
+      previous: "transcri.",
+      replacement: "transcription.",
+    });
+  });
+
+  it("prefers the fuller word's own trailing punctuation over the clipped word's", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("we discussed transcri.");
+    expect(deduper.append("discussed transcription, then the meeting")).toBe(
+      "then the meeting",
+    );
+    expect(deduper.takeCorrection()).toEqual({
+      previous: "transcri.",
+      replacement: "transcription,",
+    });
+  });
+
+  it("never carries a clipped connector such as a hyphen onto the fuller word", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("we talked about self-");
+    expect(deduper.append("self-driving")).toBe("");
+    expect(deduper.takeCorrection()).toEqual({
+      previous: "self-",
+      replacement: "self-driving",
+    });
+  });
+
+  it("keeps the clipped word's capitalization instead of the chunk-initial capital", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("we discussed transcri");
+    expect(deduper.append("Transcription of the meeting")).toBe(
+      "of the meeting",
+    );
+    expect(deduper.takeCorrection()).toEqual({
+      previous: "transcri",
+      replacement: "transcription",
+    });
+
+    deduper.reset();
+    deduper.append("Transcri");
+    deduper.append("transcription of the meeting");
+    expect(deduper.takeCorrection()).toEqual({
+      previous: "Transcri",
+      replacement: "Transcription",
+    });
+  });
+
+  it("keeps the clipped word's leading punctuation on the replacement", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append('he said "transcri');
+    expect(deduper.append("transcription of it")).toBe("of it");
+    expect(deduper.takeCorrection()).toEqual({
+      previous: '"transcri',
+      replacement: '"transcription',
+    });
+  });
+
+  it("does not treat the next chunk's shorter first word as a clip", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("we discussed transcription");
+    expect(deduper.append("transcript is done")).toBe("transcript is done");
+    expect(deduper.takeCorrection()).toBeNull();
+
+    deduper.reset();
+    deduper.append("we didn't");
+    expect(deduper.append("we did it anyway")).toBe("we did it anyway");
+    expect(deduper.takeCorrection()).toBeNull();
+  });
+
+  it("corrects a listed word when an exact-match word anchors the seam", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("we went with");
+    expect(deduper.append("went without the others")).toBe("the others");
+    expect(deduper.takeCorrection()).toEqual({
+      previous: "with",
+      replacement: "without",
+    });
+  });
+
+  it.each([
+    ["so we did", "we didn't want to"],
+    ["so I do", "I don't know"],
+    ["we talked about the end", "the ending was fine"],
+  ])(
+    "keeps a word plus its suffix apart behind a single anchor: %j + %j",
+    (first, second) => {
+      const deduper = new TranscriptOverlapDeduper();
+      deduper.append(first);
+      expect(deduper.append(second)).toBe(second);
+      expect(deduper.takeCorrection()).toBeNull();
+    },
+  );
+
+  it("merges a word plus its suffix when two exact-match words anchor the seam", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("so we could");
+    expect(deduper.append("so we couldn't make it")).toBe("make it");
+    expect(deduper.takeCorrection()).toEqual({
+      previous: "could",
+      replacement: "couldn't",
+    });
+  });
+
+  it.each([
+    ["this is the plan.", "Planet Earth is next"],
+    ["send me the note.", "notebook sales are up"],
+    ["we finished the mark,", "market is open"],
+  ])(
+    "treats an unanchored word closed by punctuation as complete: %j + %j",
+    (first, second) => {
+      const deduper = new TranscriptOverlapDeduper();
+      deduper.append(first);
+      expect(deduper.append(second)).toBe(second);
+      expect(deduper.takeCorrection()).toBeNull();
+    },
+  );
+
+  it("still merges a punctuated fragment when an exact-match word anchors the seam", () => {
+    const deduper = new TranscriptOverlapDeduper();
+    deduper.append("this is the plan.");
+    expect(deduper.append("the planet we chose")).toBe("we chose");
+    expect(deduper.takeCorrection()).toEqual({
+      previous: "plan.",
+      replacement: "planet",
+    });
+  });
+
+  it.each([
+    ["when did it start", "started raining"],
+    ["we ran the test", "tests are passing"],
+    ["we will meet", "meeting starts now"],
+    ["we could", "couldn't make it"],
+    ["we need to commit", "committed the change"],
+    ["that was the plan", "planned for later"],
+  ])(
+    "keeps an unanchored word apart from its inflected or contracted form: %j + %j",
+    (first, second) => {
+      const deduper = new TranscriptOverlapDeduper();
+      deduper.append(first);
+      expect(deduper.append(second)).toBe(second);
+      expect(deduper.takeCorrection()).toBeNull();
+    },
+  );
 });
 
 describe("LiveChunker", () => {

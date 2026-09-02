@@ -33,10 +33,73 @@ export interface LiveChunkerOptions {
 
 const TRANSCRIPT_TAIL_WORDS = 20;
 
-function normalizeTranscriptWord(word: string): string {
-  return word
-    .toLocaleLowerCase()
-    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+/** Runs of characters that are neither letters nor digits at a token's edges. */
+const LEADING_PUNCTUATION = /^[^\p{L}\p{N}]+/u;
+const TRAILING_PUNCTUATION = /[^\p{L}\p{N}]+$/u;
+
+/**
+ * Punctuation worth carrying from a clipped word onto its fuller replacement.
+ * Connectors such as a hyphen or a decimal point belong to the cut word
+ * itself ("self-" / "self-driving") and are deliberately excluded.
+ */
+const SENTENCE_PUNCTUATION = /[.,;:!?…"”)\]]+$/u;
+
+/**
+ * Shortest fragment that may be treated as a boundary-clipped word when no
+ * exact-match word anchors it in the overlap window. Shorter fragments
+ * ("a"/"and", "in"/"into", "do"/"don't") are almost always real words.
+ */
+const MIN_UNANCHORED_CLIP_LENGTH = 4;
+
+/**
+ * Common English words that are complete on their own even though they
+ * prefix unrelated longer words ("with"/"without", "some"/"something",
+ * "form"/"format"). Without an anchor word they are kept as real words
+ * rather than clipped fragments. Inflected and contracted forms are handled
+ * generically by WORD_SUFFIXES, so this list only needs to cover words that
+ * start compounds and derivations.
+ */
+const COMPLETE_SHORT_WORDS = new Set([
+  "about", "after", "again", "also", "back", "been", "before", "being",
+  "both", "come", "could", "does", "done", "down", "each", "else", "even",
+  "ever", "every", "first", "form", "from", "give", "good", "have", "here",
+  "into", "just", "know", "last", "like", "look", "made", "make", "many",
+  "more", "most", "much", "must", "need", "next", "none", "once", "only",
+  "other", "over", "part", "real", "said", "same", "shall", "should",
+  "some", "still", "such", "sure", "take", "than", "that", "them", "then",
+  "there", "these", "they", "thing", "this", "those", "time", "under",
+  "upon", "very", "want", "well", "went", "were", "what", "when", "where",
+  "which", "while", "will", "with", "work", "would", "your",
+]);
+
+/**
+ * Suffixes that turn a complete word into an inflected or contracted form.
+ * "start"/"started" or "did"/"didn't" at a seam is far more often two real
+ * words across a pause than a boundary clip, and merging them silently
+ * deletes a clause, so such pairs are only merged when two exact-match
+ * words anchor the seam. The cost of being wrong is a visible duplicate.
+ */
+const WORD_SUFFIXES = new Set([
+  "s", "es", "ed", "ing", "ly", "er", "est",
+  "n't", "'s", "'re", "'ve", "'ll", "'d", "'m",
+]);
+
+interface TranscriptWordParts {
+  leading: string;
+  core: string;
+  trailing: string;
+}
+
+/** Split a token into leading punctuation, the word itself, and trailing punctuation. */
+function splitTranscriptWord(token: string): TranscriptWordParts {
+  const leading = LEADING_PUNCTUATION.exec(token)?.[0] ?? "";
+  const rest = token.slice(leading.length);
+  const trailing = TRAILING_PUNCTUATION.exec(rest)?.[0] ?? "";
+  return { leading, core: rest.slice(0, rest.length - trailing.length), trailing };
+}
+
+function normalizeTranscriptWord(token: string): string {
+  return splitTranscriptWord(token).core.toLocaleLowerCase();
 }
 
 /**
@@ -46,6 +109,97 @@ function normalizeTranscriptWord(word: string): string {
 interface TranscriptWord {
   normalized: string;
   original: string;
+  /** The recognizer closed the word with sentence or clause punctuation. */
+  endsClause: boolean;
+}
+
+function toTranscriptWord(token: string): TranscriptWord {
+  const parts = splitTranscriptWord(token);
+  return {
+    normalized: parts.core.toLocaleLowerCase(),
+    original: token,
+    endsClause: SENTENCE_PUNCTUATION.test(parts.trailing),
+  };
+}
+
+/**
+ * Whether `fuller` is `word` plus an inflection or contraction suffix,
+ * allowing for a doubled final consonant ("commit"/"committed").
+ */
+function isInflectionOf(word: string, fuller: string): boolean {
+  const tail = fuller.slice(word.length).replace(/[’‘]/g, "'");
+  if (WORD_SUFFIXES.has(tail)) return true;
+  const last = word.slice(-1);
+  return tail.startsWith(last) && WORD_SUFFIXES.has(tail.slice(last.length));
+}
+
+/**
+ * Decide whether `previous`, the last word of the earlier chunk, is a
+ * boundary clip of `fuller`, the word at the same position in the new
+ * chunk. Only this direction is physically possible: the earlier chunk is
+ * cut at its end, while the new chunk starts before the cut and hears the
+ * whole word. `anchors` counts the exact-match words before it in the
+ * overlap window; two make a coincidence negligible, one still leaves room
+ * for a repeated function word across a pause ("so we did. We didn't…").
+ * Without any anchor there is no proof the two chunks share audio, so a
+ * word the recognizer closed with punctuation ("plan." / "Planet"), which
+ * it heard complete before a pause rather than cut mid-syllable, is never
+ * treated as a clip.
+ */
+function isClippedWord(
+  previous: TranscriptWord,
+  fuller: string,
+  anchors: number,
+): boolean {
+  const word = previous.normalized;
+  if (word.length === 0 || word === fuller) return false;
+  if (!fuller.startsWith(word)) return false;
+  if (anchors >= 2) return true;
+  if (isInflectionOf(word, fuller)) return false;
+  if (anchors === 1) return true;
+  return (
+    !previous.endsClause &&
+    word.length >= MIN_UNANCHORED_CLIP_LENGTH &&
+    !COMPLETE_SHORT_WORDS.has(word)
+  );
+}
+
+/** Give `word` the capitalization of `model`'s first letter, when it has one. */
+function matchLeadingCase(model: string, word: string): string {
+  const modelHead = Array.from(model)[0];
+  const wordHead = Array.from(word)[0];
+  if (!modelHead || !wordHead) return word;
+  const upper = modelHead.toLocaleUpperCase();
+  if (upper === modelHead.toLocaleLowerCase()) return word;
+  const head =
+    modelHead === upper
+      ? wordHead.toLocaleUpperCase()
+      : wordHead.toLocaleLowerCase();
+  return head + word.slice(wordHead.length);
+}
+
+/**
+ * Build the note replacement for a clipped word from the fuller recognition.
+ * The clipped word owns its place in the note, so its leading punctuation
+ * and capitalization are kept. The new chunk heard the whole word and what
+ * follows it, so its trailing punctuation wins; when it has none and the
+ * chunk goes on, the sentence continues and the clipped word's chunk-final
+ * punctuation is dropped. Only when nothing follows the fuller word is the
+ * clipped word's own sentence punctuation kept.
+ */
+function mergeClippedWord(
+  clipped: string,
+  fuller: string,
+  sentenceContinues: boolean,
+): string {
+  const before = splitTranscriptWord(clipped);
+  const after = splitTranscriptWord(fuller);
+  const core = matchLeadingCase(before.core, after.core);
+  const trailing =
+    (after.trailing || sentenceContinues)
+      ? after.trailing
+      : (SENTENCE_PUNCTUATION.exec(before.trailing)?.[0] ?? "");
+  return before.leading + core + trailing;
 }
 
 export interface TranscriptWordCorrection {
@@ -63,10 +217,7 @@ export class TranscriptOverlapDeduper {
     const matches = Array.from(text.matchAll(/\S+/g));
     if (matches.length === 0) return "";
 
-    const words = matches.map((match) => ({
-      normalized: normalizeTranscriptWord(match[0]),
-      original: match[0],
-    }));
+    const words = matches.map((match) => toTranscriptWord(match[0]));
     const maxOverlap = Math.min(this.prevWords.length, words.length);
     let overlap = 0;
 
@@ -74,16 +225,15 @@ export class TranscriptOverlapDeduper {
       const previousStart = this.prevWords.length - size;
       let equal = true;
       for (let index = 0; index < size; index++) {
-        const previous = this.prevWords[previousStart + index].normalized;
+        const previous = this.prevWords[previousStart + index];
         const next = words[index].normalized;
-        const exactMatch = previous.length > 0 && previous === next;
-        // The word nearest the end of the previous transcript can be clipped
-        // by the ASR at the audio boundary ("transcri" / "transcription").
+        const exactMatch =
+          previous.normalized.length > 0 && previous.normalized === next;
+        // Only the last word of the earlier chunk can be cut by the audio
+        // boundary ("transcri" / "transcription"); the exact matches before
+        // it in the window are the anchors that make the seam trustworthy.
         const clippedMatch =
-          index === size - 1 &&
-          previous.length > 0 &&
-          next.length > 0 &&
-          (previous.startsWith(next) || next.startsWith(previous));
+          index === size - 1 && isClippedWord(previous, next, index);
         if (!exactMatch && !clippedMatch) {
           equal = false;
           break;
@@ -98,17 +248,16 @@ export class TranscriptOverlapDeduper {
     if (overlap > 0) {
       const previousWord = this.prevWords[this.prevWords.length - 1];
       const nextWord = words[overlap - 1];
-      if (
-        previousWord.normalized !== nextWord.normalized &&
-        nextWord.normalized.startsWith(previousWord.normalized)
-      ) {
+      if (previousWord.normalized !== nextWord.normalized) {
         // The new chunk recognized a fuller version of the clipped word.
         // Tell the append path to correct the already-written final word.
-        this.correction = {
-          previous: previousWord.original,
-          replacement: nextWord.original,
-        };
-        this.prevWords[this.prevWords.length - 1] = nextWord;
+        const replacement = mergeClippedWord(
+          previousWord.original,
+          nextWord.original,
+          overlap < words.length,
+        );
+        this.correction = { previous: previousWord.original, replacement };
+        this.prevWords[this.prevWords.length - 1] = toTranscriptWord(replacement);
       }
     }
 

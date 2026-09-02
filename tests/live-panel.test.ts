@@ -43,11 +43,16 @@ interface Harness {
   buttons(): { startStop: FakeEl; pause: FakeEl };
   /** The owner tag the panel used for its status-bar line. */
   owner(): string;
+  /** The host's normalizeNoteTranscript, called by the stop flow. */
+  normalize: ReturnType<typeof vi.fn>;
+  registry: LiveSessionRegistry;
 }
 
 interface HarnessOptions {
   registry?: LiveSessionRegistry;
   createNote?: LiveRecordingHost["createNote"];
+  settings?: Partial<TranscriberSettings>;
+  normalize?: LiveRecordingHost["normalizeNoteTranscript"];
 }
 
 function makeHarness(opts: HarnessOptions = {}): Harness {
@@ -67,10 +72,12 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     }),
   };
   const setStatus = vi.fn();
+  const normalize = vi.fn(opts.normalize ?? (async (_note: TFile) => {}));
   const host: LiveRecordingHost = {
     settings: {
       liveChunkSeconds: 15,
       liveAudioSource: "microphone",
+      ...opts.settings,
     } as TranscriberSettings,
     resolveModelDir: () => "/vault/models",
     resolvePluginDir: () => "/vault/.obsidian/plugins/meeting-transcriber",
@@ -83,6 +90,7 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     claimLiveSession: (panel) => registry.tryClaim(panel),
     releaseLiveSession: (panel) => registry.release(panel),
     isUnloading: () => false,
+    normalizeNoteTranscript: normalize,
   };
   const leaf = new WorkspaceLeaf({ vault });
   const panel = new LiveRecordingPanel(
@@ -102,6 +110,8 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
       return { startStop, pause };
     },
     owner: () => setStatus.mock.calls[0]?.[0] as string,
+    normalize,
+    registry,
   };
 }
 
@@ -351,5 +361,103 @@ describe("LiveRecordingPanel status bar", () => {
     h.setStatus.mockClear();
     vi.advanceTimersByTime(5000);
     expect(h.setStatus).not.toHaveBeenCalled();
+  });
+});
+
+describe("LiveRecordingPanel normalization on stop", () => {
+  const normalizerOn = { normalizerEnabled: true, normalizeLiveOnStop: true };
+
+  beforeEach(() => {
+    Object.assign(globalThis, { Option, window: globalThis });
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    transcribeMock.mockReset();
+    transcribeMock.mockResolvedValue("");
+    Notice.shown.length = 0;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function recordOneChunkAndStop(h: Harness): Promise<void> {
+    await openAndStart(h);
+    feed(h.world.contexts[0], new Float32Array(16000 * 15));
+    await settle();
+    h.buttons().startStop.click(); // Stop recording
+    await settle();
+  }
+
+  it("hands the note to the host only after the session is torn down", async () => {
+    transcribeMock.mockResolvedValueOnce("hello world");
+    let atCall: { recording: boolean; button: string; stopped: boolean } | null =
+      null;
+    const h = makeHarness({
+      settings: normalizerOn,
+      normalize: async () => {
+        atCall = {
+          recording: h.registry.isRecording(),
+          button: h.buttons().startStop.text,
+          stopped: Notice.shown.includes("Live recording stopped."),
+        };
+      },
+    });
+    await recordOneChunkAndStop(h);
+
+    expect(h.normalize).toHaveBeenCalledTimes(1);
+    expect(h.normalize.mock.calls[0][0]).toMatchObject({ path: "Meetings/live.md" });
+    expect(atCall).toEqual({
+      recording: false,
+      button: "Start recording",
+      stopped: true,
+    });
+    // The raw chunk was written before normalization, never marked as silence.
+    expect(h.written).toContainEqual(expect.stringContaining("hello world"));
+    expect(h.written).not.toContainEqual(
+      expect.stringContaining("_No speech detected._"),
+    );
+  });
+
+  it("skips normalization when the session produced no speech", async () => {
+    const h = makeHarness({ settings: normalizerOn });
+    await recordOneChunkAndStop(h);
+    expect(h.normalize).not.toHaveBeenCalled();
+    expect(h.written).toContainEqual(
+      expect.stringContaining("_No speech detected._"),
+    );
+  });
+
+  it("skips normalization when the live toggle or the master switch is off", async () => {
+    transcribeMock.mockResolvedValue("hello world");
+    const toggleOff = makeHarness({
+      settings: { normalizerEnabled: true, normalizeLiveOnStop: false },
+    });
+    await recordOneChunkAndStop(toggleOff);
+    expect(toggleOff.normalize).not.toHaveBeenCalled();
+
+    const masterOff = makeHarness({
+      settings: { normalizerEnabled: false, normalizeLiveOnStop: true },
+    });
+    await recordOneChunkAndStop(masterOff);
+    expect(masterOff.normalize).not.toHaveBeenCalled();
+  });
+
+  it("does not hold the session slot while a slow normalization runs", async () => {
+    transcribeMock.mockResolvedValueOnce("hello world");
+    const registry = new LiveSessionRegistry();
+    const a = makeHarness({
+      registry,
+      settings: normalizerOn,
+      normalize: () => new Promise<void>(() => undefined), // never settles
+    });
+    await recordOneChunkAndStop(a);
+    expect(a.normalize).toHaveBeenCalledTimes(1);
+    expect(registry.isRecording()).toBe(false);
+    expect(a.buttons().startStop.text).toBe("Start recording");
+
+    // Another panel can record while the first note is still normalizing.
+    const b = makeHarness({ registry });
+    await openAndStart(b);
+    expect(Notice.shown).not.toContain(REFUSAL);
+    expect(registry.isRecording()).toBe(true);
   });
 });

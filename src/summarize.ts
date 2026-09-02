@@ -1,21 +1,22 @@
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 
-export interface ChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
-}
+import {
+  callChatCompletion,
+  type ChatMessage,
+  type LlmSettings,
+} from "./chat-completion";
+
+// The HTTP client moved to chat-completion.ts (shared with the S1-mini
+// normalizer); re-exported so existing callers and tests keep importing it
+// from here.
+export { callChatCompletion };
+export type { ChatMessage, LlmSettings };
 
 export interface SummaryResult {
   summary: string;
   description: string;
   tags: string[];
-}
-
-export interface LlmSettings {
-  llmBaseUrl: string;
-  llmApiKey: string;
-  llmModel: string;
 }
 
 /**
@@ -111,46 +112,6 @@ export function parseSummaryResponse(text: string): SummaryResult {
     );
   }
   return { summary, description, tags };
-}
-
-/**
- * Call an OpenAI-compatible /chat/completions endpoint and return the message
- * content. `fetchImpl` is injectable for tests.
- */
-export async function callChatCompletion(
-  settings: LlmSettings,
-  messages: ChatMessage[],
-  fetchImpl?: typeof fetch,
-): Promise<string> {
-  const doFetch = fetchImpl ?? fetch;
-  const base = settings.llmBaseUrl.replace(/\/+$/, "");
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (settings.llmApiKey) {
-    headers["Authorization"] = `Bearer ${settings.llmApiKey}`;
-  }
-  const res = await doFetch(`${base}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model: settings.llmModel,
-      messages,
-      temperature: 0.2,
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`LLM request failed: HTTP ${res.status} ${body}`.trim());
-  }
-  const data = (await res.json()) as {
-    choices?: { message?: { content?: string } }[];
-  };
-  const content = data.choices?.[0]?.message?.content;
-  if (typeof content !== "string") {
-    throw new Error("LLM response had no message content.");
-  }
-  return content;
 }
 
 /**

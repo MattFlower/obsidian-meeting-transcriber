@@ -23,12 +23,16 @@ import {
 } from "./transcriber";
 import { downloadModel } from "./model-download";
 import { summarizeTranscript } from "./summarize";
+import { normalizeTranscript } from "./normalize";
 import {
   applySummaryToBody,
+  extractTranscriptSection,
   formatLocalDate,
   formatLocalTime,
   mergeSummaryIntoFrontmatter,
+  NO_SPEECH_MARKER,
   noteFileName,
+  replaceTranscriptSection,
   transcriptionNoteContent,
 } from "./note";
 import {
@@ -51,6 +55,11 @@ import { StatusBoard } from "./status";
  *   machine, or a local CLI (claude -p / codex exec) using its own login —
  *   adding tags + a description to the frontmatter and a `## Summary`
  *   section at the top of the note so it is easier to search later.
+ * - Optionally normalizes transcripts with S1-mini by Superwhisper, a local
+ *   text normalizer served by Ollama / llama-server / LM Studio: the raw ASR
+ *   text in `## Transcript` is replaced with clean written English, either
+ *   automatically (new file transcriptions, live sessions when they stop) or
+ *   through the "Normalize transcript with S1-mini" command.
  *
  * Desktop only: the ASR engine is a native Node addon and audio decoding uses
  * the Web Audio API.
@@ -68,6 +77,8 @@ export default class MeetingTranscriberPlugin extends Plugin {
   /** Owner tags are per invocation, so concurrent runs never share a line. */
   private statusSequence = 0;
   private downloadingModel = false;
+  /** Paths of notes being normalized, so one is never rewritten twice at once. */
+  private normalizing = new Set<string>();
   /** Plugin-wide coordination: at most one live recording session at a time. */
   private liveSessions = new LiveSessionRegistry();
   /** Set at the start of onunload; pending live chunks are then skipped. */
@@ -108,6 +119,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
       name: "Summarize and tag this transcription",
       callback: () => {
         void this.summarizeActiveOrSuggested();
+      },
+    });
+
+    this.addCommand({
+      id: "normalize-transcript",
+      name: "Normalize transcript with S1-mini",
+      callback: () => {
+        void this.normalizeActiveOrSuggested();
       },
     });
 
@@ -236,13 +255,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
 
     this.setStatus(status, "Transcribing (this can take a while)…");
     const progress = new Notice("Transcribing… this can take a few minutes.");
+    let note: TFile | null = null;
     try {
       const text = await transcribe(samples, modelDirAbs, pluginDir);
       if (!text) {
         new Notice("Transcription produced no text.", 10000);
         return;
       }
-      await this.createTranscriptionNote(file, text);
+      note = await this.createTranscriptionNote(file, text);
       new Notice(`Transcribed ${file.name}.`, 8000);
     } catch (e) {
       new Notice(
@@ -252,6 +272,12 @@ export default class MeetingTranscriberPlugin extends Plugin {
     } finally {
       progress.hide();
       this.setStatus(status, "");
+    }
+    // The raw note exists before the model is called, so a slow or failed
+    // normalization can never lose the transcription.
+    const s = this.settings;
+    if (note && s.normalizerEnabled && s.normalizeFileTranscripts) {
+      await this.normalizeNoteTranscript(note);
     }
   }
 
@@ -291,8 +317,8 @@ export default class MeetingTranscriberPlugin extends Plugin {
   private async createTranscriptionNote(
     file: TFile,
     transcript: string,
-  ): Promise<void> {
-    await this.createNote(file.basename, `[[${file.path}]]`, transcript);
+  ): Promise<TFile> {
+    return this.createNote(file.basename, `[[${file.path}]]`, transcript);
   }
 
   /**
@@ -400,9 +426,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
       await this.summarizeFile(active);
       return;
     }
-    new NoteSuggestModal(this.app, this.settings.outputFolder, (file) => {
-      void this.summarizeFile(file);
-    }).open();
+    new NoteSuggestModal(
+      this.app,
+      this.settings.outputFolder,
+      "Pick a transcription note to summarize",
+      (file) => {
+        void this.summarizeFile(file);
+      },
+    ).open();
   }
 
   private async summarizeFile(file: TFile): Promise<void> {
@@ -438,7 +469,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     this.setStatus(status, "Summarizing…");
     try {
       const content = await this.app.vault.read(file);
-      const transcript = extractTranscript(content) || content;
+      const transcript = extractTranscriptSection(content) || content;
       const result = await summarizeTranscript(this.settings, transcript);
       // 1) Insert/replace the `## Summary` section in the body, preserving the
       //    existing frontmatter bytes verbatim. vault.process re-reads the
@@ -465,30 +496,129 @@ export default class MeetingTranscriberPlugin extends Plugin {
       this.setStatus(status, "");
     }
   }
-}
 
-/**
- * Extract the `## Transcript` section from a note (fallback: whole body
- * after the frontmatter). Used as the LLM input for summarization.
- */
-function extractTranscript(markdown: string): string {
-  const lines = markdown.split("\n");
-  let start = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^##\s+Transcript\s*$/i.test(lines[i])) {
-      start = i + 1;
-      break;
+  // ---------------------------------------------------------------------
+  // Normalize (S1-mini by Superwhisper)
+  // ---------------------------------------------------------------------
+
+  private async normalizeActiveOrSuggested(): Promise<void> {
+    const active = this.app.workspace.getActiveFile();
+    if (active && active.extension === "md") {
+      await this.normalizeNoteTranscript(active);
+      return;
+    }
+    new NoteSuggestModal(
+      this.app,
+      this.settings.outputFolder,
+      "Pick a transcription note to normalize",
+      (file) => {
+        void this.normalizeNoteTranscript(file);
+      },
+    ).open();
+  }
+
+  /** Why the normalizer cannot run right now, or null when it can. */
+  private normalizerUnavailableReason(): string | null {
+    const s = this.settings;
+    if (!s.normalizerEnabled) {
+      return "Enable S1-mini normalization in the plugin settings first.";
+    }
+    if (!s.normalizerBaseUrl.trim() || !s.normalizerModel.trim()) {
+      return "Set the S1-mini server URL and model name in settings first.";
+    }
+    return null;
+  }
+
+  /**
+   * Rewrite the `## Transcript` section of `file` with S1-mini's normalized
+   * text. Shared by the command, the file-transcription path and the live
+   * panel's stop flow. Never rejects: every failure is reported with a
+   * Notice and leaves the raw transcript in the note untouched.
+   */
+  async normalizeNoteTranscript(file: TFile): Promise<void> {
+    const reason = this.normalizerUnavailableReason();
+    if (reason) {
+      new Notice(reason, 15000);
+      return;
+    }
+    if (this.normalizing.has(file.path)) {
+      new Notice(`Already normalizing ${file.name}.`, 8000);
+      return;
+    }
+    this.normalizing.add(file.path);
+    const status = this.newStatusOwner("normalize");
+    // Sticky (timeout 0): updated per chunk below and hidden in finally.
+    const notice = new Notice("Normalizing with S1-mini…", 0);
+    this.setStatus(status, "Normalizing transcript…");
+    try {
+      const content = await this.app.vault.read(file);
+      const raw = extractTranscriptSection(content);
+      if (raw === null) {
+        new Notice(`No "## Transcript" section in ${file.name}.`, 10000);
+        return;
+      }
+      if (!raw || raw === NO_SPEECH_MARKER) {
+        new Notice(`Nothing to normalize in ${file.name}.`, 8000);
+        return;
+      }
+      const result = await normalizeTranscript(this.settings, raw, {
+        onProgress: ({ chunk, total }) => {
+          notice.messageEl.setText(
+            `Normalizing with S1-mini… chunk ${chunk}/${total}`,
+          );
+          this.setStatus(status, `Normalizing ${chunk}/${total}`);
+        },
+      });
+      if (!result.text) {
+        new Notice(
+          `S1-mini returned no text; ${file.name} was left unchanged.`,
+          10000,
+        );
+        return;
+      }
+      // vault.process re-reads the note under Obsidian's write lock. If the
+      // transcript changed while the model ran (a late live chunk, a user
+      // edit), the normalized text no longer corresponds to it: keep the
+      // note as it is rather than overwrite the newer text.
+      let applied = false;
+      await this.app.vault.process(file, (current) => {
+        if (extractTranscriptSection(current) !== raw) return current;
+        applied = true;
+        return replaceTranscriptSection(current, result.text);
+      });
+      if (!applied) {
+        new Notice(
+          `The transcript in ${file.name} changed while S1-mini was ` +
+            "running; nothing was applied. Run the command again.",
+          15000,
+        );
+        return;
+      }
+      const chunks = `${result.chunks} chunk${result.chunks === 1 ? "" : "s"}`;
+      const kept =
+        result.fallbackChunks > 0
+          ? `, ${result.fallbackChunks} kept raw text`
+          : "";
+      // An empty reply to a long chunk is the signature of a server with
+      // thinking still on (it blanks long inputs and may still answer short
+      // ones), so name the likely fix rather than just the count.
+      const hint =
+        result.fallbackChunks > 0 && result.emptyChunks > 0
+          ? " Empty replies usually mean thinking mode is still on in the " +
+            "server; see the README."
+          : "";
+      new Notice(
+        `Normalized ${file.name} (${chunks}${kept}).${hint}`,
+        hint ? 15000 : 8000,
+      );
+    } catch (e) {
+      new Notice(`Normalization failed: ${(e as Error).message}`, 15000);
+    } finally {
+      notice.hide();
+      this.setStatus(status, "");
+      this.normalizing.delete(file.path);
     }
   }
-  if (start === -1) return "";
-  let end = lines.length;
-  for (let i = start; i < lines.length; i++) {
-    if (/^##\s+/.test(lines[i])) {
-      end = i;
-      break;
-    }
-  }
-  return lines.slice(start, end).join("\n").trim();
 }
 
 /** Suggest modal listing audio files in the vault. */
@@ -530,10 +660,11 @@ class NoteSuggestModal extends SuggestModal<TFile> {
   constructor(
     app: MeetingTranscriberPlugin["app"],
     outputFolder: string,
+    placeholder: string,
     onChoose: (f: TFile) => void,
   ) {
     super(app);
-    this.setPlaceholder("Pick a transcription note to summarize");
+    this.setPlaceholder(placeholder);
     this.onChoose = onChoose;
     const folder = outputFolder.replace(/^\/+|\/+$/g, "");
     this.notes = app.vault

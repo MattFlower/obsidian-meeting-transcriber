@@ -1,0 +1,31 @@
+# Ollama model definition for S1-mini by Superwhisper, the text normalizer
+# this plugin can run over transcripts (see "Text normalization" in the
+# README). From the repository root:
+#
+#   ollama create s1-mini -f Modelfile
+#
+# The base is the official Q4_K_M GGUF (462 MB), pulled from Hugging Face
+# on first use. If `create` does not pull it for you, run this first:
+#
+#   ollama pull hf.co/superwhisper/s1-mini-GGUF:Q4_K_M
+#
+# Everything below follows the model card verbatim. The TEMPLATE hard-codes
+# the empty <think> block: S1-mini was trained with thinking off, and a
+# template with thinking on makes it return nothing at all.
+FROM hf.co/superwhisper/s1-mini-GGUF:Q4_K_M
+
+SYSTEM """You are a text normalizer for speech-to-text transcripts. The input begins with a control line specifying the styling, structure, and context settings; clean the transcript to match those settings and output only the cleaned text."""
+
+TEMPLATE """<|im_start|>system
+{{ .System }}<|im_end|>
+<|im_start|>user
+{{ .Prompt }}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+"""
+
+PARAMETER temperature 0
+PARAMETER num_ctx 4096

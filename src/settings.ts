@@ -1,6 +1,12 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type MeetingTranscriberPlugin from "./main";
 import type { LiveAudioSource } from "./live";
+import {
+  NORMALIZER_STRUCTURES,
+  NORMALIZER_STYLINGS,
+  type NormalizerStructure,
+  type NormalizerStyling,
+} from "./normalize";
 
 export type SummarizerBackend = "cloud" | "local" | "cli";
 
@@ -29,6 +35,22 @@ export interface TranscriberSettings {
   liveAudioSource: LiveAudioSource;
   /** Seconds of audio per live transcription chunk (clamped 5–60). */
   liveChunkSeconds: number;
+  /** Master switch for transcript normalization with S1-mini by Superwhisper. */
+  normalizerEnabled: boolean;
+  /** Base URL of the local OpenAI-compatible server running S1-mini. */
+  normalizerBaseUrl: string;
+  /** Optional Bearer token for that server. */
+  normalizerApiKey: string;
+  /** Model name the server knows S1-mini by. */
+  normalizerModel: string;
+  /** S1-mini control line: register of the output. */
+  normalizerStyling: NormalizerStyling;
+  /** S1-mini control line: whether Markdown bullets are allowed. */
+  normalizerStructure: NormalizerStructure;
+  /** Normalize notes created by the file transcription command. */
+  normalizeFileTranscripts: boolean;
+  /** Normalize a live recording's note once the session stops. */
+  normalizeLiveOnStop: boolean;
 }
 
 export const DEFAULT_SETTINGS: TranscriberSettings = {
@@ -44,6 +66,14 @@ export const DEFAULT_SETTINGS: TranscriberSettings = {
   defaultTags: ["meeting"],
   liveAudioSource: "microphone",
   liveChunkSeconds: 15,
+  normalizerEnabled: false,
+  normalizerBaseUrl: "http://localhost:11434/v1",
+  normalizerApiKey: "",
+  normalizerModel: "s1-mini",
+  normalizerStyling: "semi-formal",
+  normalizerStructure: "prose",
+  normalizeFileTranscripts: true,
+  normalizeLiveOnStop: true,
 };
 
 export class TranscriberSettingTab extends PluginSettingTab {
@@ -261,5 +291,154 @@ export class TranscriberSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    new Setting(containerEl)
+      .setName("Normalize transcripts with S1-mini by Superwhisper")
+      .setDesc(
+        "Rewrite raw transcripts as clean written text (fillers removed, " +
+          "self-corrections resolved, punctuation and capitalization " +
+          "applied, numbers and dates written out) with the S1-mini text " +
+          "normalizer, served by a local OpenAI-compatible server such as " +
+          "Ollama, llama-server or LM Studio. English only. The raw " +
+          "transcript in the note is replaced. See the README for server " +
+          "setup.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.normalizerEnabled)
+          .onChange(async (value) => {
+            this.plugin.settings.normalizerEnabled = value;
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+
+    if (this.plugin.settings.normalizerEnabled) {
+      new Setting(containerEl)
+        .setName("S1-mini server URL")
+        .setDesc(
+          "OpenAI-compatible base URL of the server running S1-mini: " +
+            "Ollama http://localhost:11434/v1, llama-server " +
+            "http://localhost:8080/v1, LM Studio http://localhost:1234/v1.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("http://localhost:11434/v1")
+            .setValue(this.plugin.settings.normalizerBaseUrl)
+            .onChange(async (value) => {
+              this.plugin.settings.normalizerBaseUrl =
+                value.trim() || "http://localhost:11434/v1";
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("S1-mini API key")
+        .setDesc("Optional Bearer token; leave empty for local servers.")
+        .addText((text) =>
+          text
+            .setPlaceholder("(none)")
+            .setValue(this.plugin.settings.normalizerApiKey)
+            .onChange(async (value) => {
+              this.plugin.settings.normalizerApiKey = value.trim();
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("S1-mini model name")
+        .setDesc(
+          "The name the server knows the model by: s1-mini when created " +
+            "from the Ollama Modelfile, any name for llama-server, the " +
+            "loaded model's identifier in LM Studio.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("s1-mini")
+            .setValue(this.plugin.settings.normalizerModel)
+            .onChange(async (value) => {
+              this.plugin.settings.normalizerModel = value.trim() || "s1-mini";
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("S1-mini styling")
+        .setDesc(
+          "Register of the output: casual (all lowercase), semi-casual " +
+            "(speaker's phrasing kept), semi-formal (standard written " +
+            "English, contractions kept), formal (contractions expanded).",
+        )
+        .addDropdown((dropdown) => {
+          for (const styling of NORMALIZER_STYLINGS) {
+            dropdown.addOption(
+              styling,
+              styling === "semi-formal" ? "semi-formal (default)" : styling,
+            );
+          }
+          dropdown
+            .setValue(this.plugin.settings.normalizerStyling)
+            .onChange(async (value) => {
+              this.plugin.settings.normalizerStyling =
+                value as NormalizerStyling;
+              await this.plugin.saveSettings();
+            });
+        });
+
+      new Setting(containerEl)
+        .setName("S1-mini structure")
+        .setDesc(
+          "prose keeps everything in sentences; lists lets the model turn " +
+            "a clear enumeration of three or more items into Markdown " +
+            "bullets.",
+        )
+        .addDropdown((dropdown) => {
+          for (const structure of NORMALIZER_STRUCTURES) {
+            dropdown.addOption(
+              structure,
+              structure === "prose" ? "prose (default)" : structure,
+            );
+          }
+          dropdown
+            .setValue(this.plugin.settings.normalizerStructure)
+            .onChange(async (value) => {
+              this.plugin.settings.normalizerStructure =
+                value as NormalizerStructure;
+              await this.plugin.saveSettings();
+            });
+        });
+
+      new Setting(containerEl)
+        .setName("Normalize transcribed audio files")
+        .setDesc(
+          "Run S1-mini on each note created by 'Transcribe meeting audio " +
+            "to note' right after it is written. If the server cannot be " +
+            "reached, the raw transcript is kept.",
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.normalizeFileTranscripts)
+            .onChange(async (value) => {
+              this.plugin.settings.normalizeFileTranscripts = value;
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("Normalize live recordings when they stop")
+        .setDesc(
+          "Run S1-mini once over the whole transcript after a live " +
+            "recording session ends. Chunks are never normalized " +
+            "individually while recording.",
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.normalizeLiveOnStop)
+            .onChange(async (value) => {
+              this.plugin.settings.normalizeLiveOnStop = value;
+              await this.plugin.saveSettings();
+            }),
+        );
+    }
   }
 }

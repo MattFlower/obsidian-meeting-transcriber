@@ -4,12 +4,14 @@ import {
   applySummary,
   applySummaryToBody,
   emitFrontmatter,
+  extractTranscriptSection,
   formatLocalDate,
   formatLocalTime,
   insertSummarySection,
   mergeSummaryIntoFrontmatter,
   noteFileName,
   parseFrontmatter,
+  replaceTranscriptSection,
   sanitizeFileName,
   splitFrontmatter,
   transcriptionNoteContent,
@@ -382,6 +384,66 @@ describe("local time formatters", () => {
     expect(fileName.startsWith(formatLocalDate(date))).toBe(true);
     expect(`${formatLocalDate(date)} ${formatLocalTime(date)}`).toBe(
       "2026-09-01 23:59",
+    );
+  });
+});
+
+describe("extractTranscriptSection", () => {
+  it("returns null when there is no Transcript heading", () => {
+    expect(extractTranscriptSection("# T\n\nbody\n")).toBeNull();
+  });
+
+  it("returns an empty string for an empty section", () => {
+    expect(extractTranscriptSection("# T\n\n## Transcript\n\n\n")).toBe("");
+  });
+
+  it("returns the trimmed body up to the next heading", () => {
+    const md =
+      "---\ntitle: x\n---\n\n# T\n\n## Transcript\n\nfirst\n\nsecond\n\n" +
+      "## Action items\n- a\n";
+    expect(extractTranscriptSection(md)).toBe("first\n\nsecond");
+  });
+});
+
+describe("replaceTranscriptSection", () => {
+  const md =
+    "---\ntags:\n  - meeting\n---\n\n# T\n\n## Summary\n\nS\n\n" +
+    "## Transcript\n\nraw one\n\nraw two\n\n## Action items\n- a\n";
+
+  it("replaces only the transcript body, keeping frontmatter, title and other sections", () => {
+    expect(replaceTranscriptSection(md, "Clean one.\n\nClean two.")).toBe(
+      "---\ntags:\n  - meeting\n---\n\n# T\n\n## Summary\n\nS\n\n" +
+        "## Transcript\n\nClean one.\n\nClean two.\n\n## Action items\n- a\n",
+    );
+  });
+
+  it("keeps a single trailing newline when Transcript is the last section", () => {
+    expect(
+      replaceTranscriptSection("# T\n\n## Transcript\n\nraw\n", "Clean."),
+    ).toBe("# T\n\n## Transcript\n\nClean.\n");
+  });
+
+  it("normalizes blank-line pileup around the new body", () => {
+    expect(
+      replaceTranscriptSection(
+        "## Transcript\n\n\n\nraw\n\n\n\n## Next\nx\n",
+        "Clean.",
+      ),
+    ).toBe("## Transcript\n\nClean.\n\n## Next\nx\n");
+  });
+
+  it("returns the note unchanged without a Transcript heading or with blank text", () => {
+    expect(replaceTranscriptSection("# T\n\nbody\n", "Clean.")).toBe(
+      "# T\n\nbody\n",
+    );
+    expect(replaceTranscriptSection(md, "   ")).toBe(md);
+  });
+
+  it("round-trips through extractTranscriptSection", () => {
+    const out = replaceTranscriptSection(md, "Clean.");
+    expect(extractTranscriptSection(out)).toBe("Clean.");
+    expect(extractTranscriptSection(sampleNote)).toBe(
+      "Alice: Let's ship it.\nBob: Agreed.",
     );
   });
 });

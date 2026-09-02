@@ -11,7 +11,7 @@ import {
   TranscriptOverlapDeduper,
   type TranscriptWordCorrection,
 } from "./live";
-import { appendToTranscriptSection } from "./note";
+import { appendToTranscriptSection, NO_SPEECH_MARKER } from "./note";
 import { missingModelFilesMessage, transcribe } from "./transcriber";
 import type { TranscriberSettings } from "./settings";
 
@@ -46,6 +46,12 @@ export interface LiveRecordingHost {
   releaseLiveSession(panel: LiveRecordingPanel): void;
   /** True once the plugin has begun unloading; pending chunks are skipped. */
   isUnloading(): boolean;
+  /**
+   * Rewrite the note's `## Transcript` section with S1-mini by Superwhisper.
+   * Resolves when done and never rejects: the plugin reports progress and
+   * failures itself and keeps the raw text when the model cannot run.
+   */
+  normalizeNoteTranscript(note: TFile): Promise<void>;
 }
 
 function clampChunkSeconds(value: number): number {
@@ -519,6 +525,7 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
   private async stopSession(): Promise<void> {
     if (!this.session.isRecording() || this.stopping) return;
     this.stopping = true;
+    let toNormalize: TFile | null = null;
     try {
       const tail = await this.session.stop();
       if (tail) {
@@ -534,6 +541,8 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
       }
       if (this.note && !this.producedText) {
         await this.markNoSpeech(this.note);
+      } else if (this.note && this.shouldNormalizeOnStop()) {
+        toNormalize = this.note;
       }
     } finally {
       this.stopTicking();
@@ -544,13 +553,31 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
       this.refreshUi();
       new Notice("Live recording stopped.", 5000);
     }
+    // Only after the teardown above: the pump has drained, so no more seam
+    // corrections can land in the note, and the session slot is free and the
+    // panel idle, so a slow model call never blocks Stop or the next
+    // recording. Chunks are never normalized individually: the seam
+    // de-duper matches words across chunks, and rewritten words would
+    // break it. The host reports progress and failures itself.
+    if (toNormalize) {
+      await this.host.normalizeNoteTranscript(toNormalize).catch(() => undefined);
+    }
+  }
+
+  private shouldNormalizeOnStop(): boolean {
+    const s = this.host.settings;
+    return (
+      s.normalizerEnabled === true &&
+      s.normalizeLiveOnStop === true &&
+      !this.host.isUnloading()
+    );
   }
 
   /** Record in the note that the session produced no transcript text. */
   private async markNoSpeech(note: TFile): Promise<void> {
     try {
       await this.app.vault.process(note, (content) =>
-        appendToTranscriptSection(content, "_No speech detected._"),
+        appendToTranscriptSection(content, NO_SPEECH_MARKER),
       );
     } catch {
       // The note may have been deleted or renamed meanwhile.

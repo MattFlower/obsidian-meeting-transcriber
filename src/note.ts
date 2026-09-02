@@ -195,6 +195,72 @@ export function insertSummarySection(body: string, summary: string): string {
   return [...before, section, "", ...after].join("\n");
 }
 
+/** The paragraph a live session writes when it produced no transcript text. */
+export const NO_SPEECH_MARKER = "_No speech detected._";
+
+interface SectionBounds {
+  /** Index of the `## Transcript` heading line. */
+  headingIdx: number;
+  /** Index of the next `## ` heading, or the line count (end of file). */
+  end: number;
+}
+
+/** Locate the `## Transcript` section, or null when there is no heading. */
+function findTranscriptSection(lines: string[]): SectionBounds | null {
+  let headingIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s+Transcript\s*$/i.test(lines[i].trim())) {
+      headingIdx = i;
+      break;
+    }
+  }
+  if (headingIdx === -1) return null;
+  let end = lines.length;
+  for (let i = headingIdx + 1; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  return { headingIdx, end };
+}
+
+/**
+ * The body of the `## Transcript` section, trimmed of surrounding blank
+ * lines: "" for an empty section, null when the note has no such heading.
+ * Pure so it can be tested.
+ */
+export function extractTranscriptSection(markdown: string): string | null {
+  const lines = markdown.split("\n");
+  const bounds = findTranscriptSection(lines);
+  if (!bounds) return null;
+  return lines.slice(bounds.headingIdx + 1, bounds.end).join("\n").trim();
+}
+
+/**
+ * Replace the body of the `## Transcript` section with `text`, keeping the
+ * frontmatter, the title, the heading itself and every other section
+ * verbatim, with exactly one blank line after the heading and before the
+ * next one. Returns the note unchanged when it has no `## Transcript`
+ * heading or `text` is blank: callers report that rather than rewriting the
+ * whole body (which would eat `## Summary`). Pure so it can be tested.
+ */
+export function replaceTranscriptSection(
+  markdown: string,
+  text: string,
+): string {
+  const trimmed = text.trim();
+  if (!trimmed) return markdown;
+  const lines = markdown.split("\n");
+  const bounds = findTranscriptSection(lines);
+  if (!bounds) return markdown;
+  const before = lines.slice(0, bounds.headingIdx);
+  const after = lines.slice(bounds.end);
+  return [...before, lines[bounds.headingIdx], "", trimmed, "", ...after].join(
+    "\n",
+  );
+}
+
 /**
  * Append `text` as a new paragraph at the end of the `## Transcript`
  * section (before the next `## ` heading, or end of file). When no
@@ -210,26 +276,11 @@ export function appendToTranscriptSection(
   if (!trimmed) return markdown;
 
   const lines = markdown.split("\n");
-  let headingIdx = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^##\s+Transcript\s*$/i.test(lines[i].trim())) {
-      headingIdx = i;
-      break;
-    }
-  }
-
-  if (headingIdx === -1) {
+  const bounds = findTranscriptSection(lines);
+  if (!bounds) {
     return `${markdown.replace(/\s+$/, "")}\n\n## Transcript\n\n${trimmed}\n`;
   }
-
-  // End of the section: the next `## ` heading, or end of file.
-  let end = lines.length;
-  for (let i = headingIdx + 1; i < lines.length; i++) {
-    if (/^##\s+/.test(lines[i])) {
-      end = i;
-      break;
-    }
-  }
+  const { headingIdx, end } = bounds;
 
   // Existing section content, trimmed of surrounding blank lines so repeated
   // appends do not accumulate blank lines.

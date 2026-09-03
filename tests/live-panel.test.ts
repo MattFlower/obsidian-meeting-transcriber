@@ -96,6 +96,8 @@ interface Harness {
   sink: FakeSink;
   /** The panel's three selects: audio source, microphone, system device. */
   selects(): { source: FakeEl; mic: FakeEl; device: FakeEl };
+  /** Simulate the user editing the open note. */
+  edit(fn: (content: string) => string): void;
   registry: LiveSessionRegistry;
 }
 
@@ -183,6 +185,9 @@ function makeHarness(opts: HarnessOptions = {}): Harness {
     selects: () => {
       const [source, mic, device] = content.findAll((el) => el.tag === "select");
       return { source, mic, device };
+    },
+    edit: (fn) => {
+      current = fn(current);
     },
     registry,
   };
@@ -819,5 +824,25 @@ describe("LiveRecordingPanel speaker pass on stop", () => {
       "me:Agreed,",
       "me:tomorrow.",
     ]);
+  });
+
+  it("hands the speaker pass exactly what it wrote so user edits can be detected", async () => {
+    transcribeMock
+      .mockResolvedValueOnce("hello world")
+      .mockResolvedValueOnce("and more");
+    const h = makeHarness({ settings: speakersOn });
+    await openAndStart(h);
+    feed(h.world.contexts[0], new Float32Array(16000 * 15));
+    await settle();
+    // The user fixes a word while the recording is still running.
+    h.edit((content) => content.replace("hello", "HELLO"));
+    feed(h.world.contexts[0], new Float32Array(16000 * 15));
+    await settle();
+    h.buttons().startStop.click();
+    await settle();
+
+    const [, source] = h.assignSpeakers.mock.calls[0] as [TFile, LiveSpeakerSource];
+    expect(source.expectedTranscript).toBe("hello world\n\nand more");
+    expect(h.written[h.written.length - 1]).toContain("HELLO world\n\nand more");
   });
 });

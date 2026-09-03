@@ -10,6 +10,7 @@ import {
   encodePcm16,
   interleave,
   wavHeader,
+  readWavPcm16Channel,
 } from "../src/wav";
 
 // ---------------------------------------------------------------------------
@@ -463,7 +464,86 @@ describe("WavFileWriter", () => {
 
   it("open() rejects when the path itself is a directory", async () => {
     await withDir(async (dir) => {
-      await expect(WavFileWriter.open(dir)).rejects.toThrow(/EISDIR/);
+      await expect(WavFileWriter.open(dir)).rejects.toThrow(/EEXIST|EISDIR/);
     });
+  });
+});
+
+describe("readWavPcm16Channel", () => {
+  async function tempFile(name: string): Promise<{ file: string; cleanup: () => Promise<void> }> {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const p = await import("node:path");
+    const dir = await fs.mkdtemp(p.join(os.tmpdir(), "wav-read-"));
+    return {
+      file: p.join(dir, name),
+      cleanup: () => fs.rm(dir, { recursive: true, force: true }),
+    };
+  }
+  const close = (a: number, b: number) => Math.abs(a - b) < 1.5 / 32768;
+
+  it("reads one channel or the mix of a stereo file block by block", async () => {
+    const { file, cleanup } = await tempFile("stereo.wav");
+    const left = Float32Array.from({ length: 1000 }, (_, i) => (i % 100) / 200);
+    const right = Float32Array.from({ length: 1000 }, (_, i) => -(i % 50) / 100);
+    const w = await WavFileWriter.open(file, 16000, 2);
+    w.write([left.subarray(0, 600), right.subarray(0, 600)]);
+    w.write([left.subarray(600), right.subarray(600)]);
+    await w.close();
+
+    // A 64-byte block holds 16 stereo frames, so reads straddle every boundary.
+    const l = await readWavPcm16Channel(file, 0, { blockBytes: 64 });
+    expect(l).not.toBeNull();
+    expect(l!.channels).toBe(2);
+    expect(l!.sampleRate).toBe(16000);
+    expect(l!.samples.length).toBe(1000);
+    const r = await readWavPcm16Channel(file, 1, { blockBytes: 64 });
+    const mix = await readWavPcm16Channel(file, "mix", { blockBytes: 64 });
+    for (const i of [0, 1, 15, 16, 17, 599, 600, 601, 999]) {
+      expect(close(l!.samples[i], left[i])).toBe(true);
+      expect(close(r!.samples[i], right[i])).toBe(true);
+      expect(close(mix!.samples[i], (left[i] + right[i]) / 2)).toBe(true);
+    }
+    await expect(readWavPcm16Channel(file, 2)).rejects.toThrow(RangeError);
+    await cleanup();
+  });
+
+  it("uses the bytes present when the header was never patched", async () => {
+    const { file, cleanup } = await tempFile("crashed.wav");
+    const fs = await import("node:fs/promises");
+    const samples = Float32Array.from({ length: 300 }, (_, i) => Math.sin(i / 10) / 2);
+    await fs.writeFile(
+      file,
+      Buffer.concat([wavHeader(0, 16000, 1), encodePcm16(samples)]),
+    );
+    const read = await readWavPcm16Channel(file, 0, { blockBytes: 100 });
+    expect(read!.samples.length).toBe(300);
+    expect(close(read!.samples[299], samples[299])).toBe(true);
+    await cleanup();
+  });
+
+  it("returns null for a file that is not 16-bit PCM", async () => {
+    const { file, cleanup } = await tempFile("garbage.wav");
+    const fs = await import("node:fs/promises");
+    await fs.writeFile(file, Buffer.from("not a wave file at all, sorry"));
+    expect(await readWavPcm16Channel(file, 0)).toBeNull();
+    await cleanup();
+  });
+});
+
+describe("WavFileWriter exclusive create", () => {
+  it("refuses to overwrite an existing file", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const p = await import("node:path");
+    const dir = await fs.mkdtemp(p.join(os.tmpdir(), "wav-excl-"));
+    const file = p.join(dir, "rec.wav");
+    const w = await WavFileWriter.open(file);
+    await w.close();
+    await expect(WavFileWriter.open(file)).rejects.toThrow(/EEXIST/);
+    const stat = await fs.stat(file);
+    // Owner read/write only.
+    expect(stat.mode & 0o777).toBe(0o600);
+    await fs.rm(dir, { recursive: true, force: true });
   });
 });

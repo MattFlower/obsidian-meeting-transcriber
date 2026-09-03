@@ -386,8 +386,10 @@ export class TranscriberSettingTab extends PluginSettingTab {
         .setName("Clustering threshold")
         .setDesc(
           "Used when the speaker count is detected automatically (default " +
-            "0.5). Raise it if one person is split into several speakers; " +
-            "lower it if two people are merged into one.",
+            "0.5). Raise it if one person is split into several speakers " +
+            "(meeting audio often needs 0.7–0.9); lower it if two people " +
+            "are merged into one. More than 12 detected speakers is treated " +
+            "as a failed detection and no labels are applied.",
         )
         .addText((text) =>
           text

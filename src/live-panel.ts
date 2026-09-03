@@ -27,6 +27,7 @@ import {
 import {
   appendToTranscriptSection,
   appendTurnsToTranscriptSection,
+  extractTranscriptSection,
   NO_SPEECH_MARKER,
 } from "./note";
 import { buildTurns } from "./speakers";
@@ -238,6 +239,11 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
   private warnedSilentLoopback = false;
   /** Every word written this session, on the session timeline, for the speaker pass. */
   private sessionWords: LaneWord[] = [];
+  /**
+   * A shadow of the transcript section built from this panel's own writes
+   * only, so the speaker pass can tell the user's edits from its text.
+   */
+  private shadow = "";
   private audioSink: LiveAudioSink | null = null;
   /**
    * Frames captured before the audio file was open (creating the note takes
@@ -656,6 +662,7 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
     this.pump = Promise.resolve();
     this.dedupers.clear();
     this.sessionWords = [];
+    this.shadow = "## Transcript\n";
     this.refreshUi();
     this.startTicking();
     if (this.pendingFrames) await this.openSink(note);
@@ -769,7 +776,12 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
         if (audioPath && !this.host.isUnloading()) {
           toDiarize = {
             note,
-            source: { words: this.sessionWords, audioPath, lanes: this.lanes },
+            source: {
+              words: this.sessionWords,
+              audioPath,
+              lanes: this.lanes,
+              expectedTranscript: extractTranscriptSection(this.shadow) ?? "",
+            },
           };
         }
         if (this.shouldNormalizeOnStop()) toNormalize = note;
@@ -947,14 +959,17 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
           : [];
       // vault.process is an atomic read-modify-write, so an edit the user
       // makes in the open note between windows is never overwritten by a
-      // copy read a moment earlier.
-      await this.app.vault.process(note, (content) => {
+      // copy read a moment earlier. The same mutation is applied to the
+      // shadow so it stays exactly what this panel wrote.
+      const mutate = (content: string): string => {
         let next = content;
         for (const { label, correction } of corrections) {
           next = correctTranscriptWord(next, correction, label);
         }
         return appendTurnsToTranscriptSection(next, turns);
-      });
+      };
+      this.shadow = mutate(this.shadow);
+      await this.app.vault.process(note, mutate);
     } finally {
       this.transcribing = false;
       this.updateStatus();

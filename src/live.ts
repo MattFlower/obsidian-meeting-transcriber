@@ -176,6 +176,12 @@ export interface LiveSpeakerSource {
   /** Absolute path of the WAV holding the session's audio, one channel per lane. */
   audioPath: string;
   lanes: LiveLane[];
+  /**
+   * The `## Transcript` body exactly as the panel wrote it. The speaker pass
+   * compares it with the note before rewriting: any difference is a user
+   * edit made during the recording, which must not be thrown away.
+   */
+  expectedTranscript: string;
 }
 
 /**

@@ -303,13 +303,15 @@ Then:
   voice is found, the transcript stays unlabelled and is split into
   paragraphs at pauses instead.
 - **Live recordings** are labelled when the session stops. While it runs, the
-  audio is written to a temporary WAV outside the vault
-  (`<system temp dir>/obsidian-meeting-transcriber/`, ~115 MB per hour at
-  16 kHz mono; paused spans are not recorded). The pass runs on that file
-  after "Live recording stopped." using the words already transcribed, then
-  deletes the file. If the pass fails, the file is kept and its path is
-  stored in the note's `audio:` frontmatter so the command below can retry;
-  a successful retry deletes it.
+  audio is written to a temporary WAV outside the vault, in a private folder
+  of its own (`<system temp dir>/obsidian-meeting-transcriber-*/`, owner-only,
+  ~115 MB per hour at 16 kHz mono; paused spans are not recorded). The pass
+  runs on that file after "Live recording stopped." using the words already
+  transcribed, then deletes the folder. If you edited the transcript while
+  the recording was running, the automatic pass leaves your note alone. In
+  that case, and whenever the pass fails, the audio is kept and its path is
+  stored in the note's `audio:` frontmatter so the command below can label
+  it on request; a successful run deletes it.
 - **Assign speakers to transcript** runs the pass on demand on the active
   note (or one picked from the output folder). It re-transcribes the audio
   the note's frontmatter points at — `source:` for a vault audio file,
@@ -320,9 +322,16 @@ Then:
 Two settings tune the clustering. **Number of speakers** is `0` to detect the
 count automatically; any other value is used as the *exact* number of
 speakers, not a maximum, so set it only when you know how many people spoke.
-**Clustering threshold** (default `0.5`) applies to automatic detection: raise
-it if one person is split into several speakers, lower it if two people are
-merged into one.
+**Clustering threshold** (default `0.5`) applies to automatic detection.
+sherpa-onnx clusters the voice embeddings with complete-linkage hierarchical
+clustering cut at this cosine distance, so a cluster only survives when
+*every* pair of its segments is closer than the threshold; on real meeting
+audio, with short segments, cross-talk and room noise, `0.5` can shatter one
+person into many "speakers". Raise it if that happens (`0.7`–`0.9` is a
+sensible range), lower it if two people are merged into one. When automatic
+detection finds more than 12 speakers the plugin treats the detection as
+failed: no labels are applied, a notice names the two settings above, and a
+live recording's audio is kept for a rerun of the command.
 
 Diarization runs after transcription and before S1-mini normalization; the
 normalizer then works turn by turn, so labels survive it and short replies

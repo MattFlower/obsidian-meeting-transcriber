@@ -33,7 +33,7 @@ import {
   type DiarizationOptions,
 } from "./diarize";
 import { mixedSpeakerTranscript, speakerTranscript } from "./speakers";
-import { decodeWavPcm16, WavFileWriter } from "./wav";
+import { decodeWavPcm16, readWavPcm16Channel, WavFileWriter } from "./wav";
 import { downloadDiarizationModels, downloadModel } from "./model-download";
 import { summarizeTranscript } from "./summarize";
 import { normalizeSpeakerTranscript } from "./normalize";
@@ -88,9 +88,50 @@ import { StatusBoard } from "./status";
  * Desktop only: the ASR engine is a native Node addon and audio decoding uses
  * the Web Audio API.
  */
-/** Folder for the temporary WAV a live session keeps until its speaker pass ran. */
-export function liveAudioTempDir(): string {
-  return path.join(os.tmpdir(), "obsidian-meeting-transcriber");
+/**
+ * Prefix of the private per-session folders (created with `mkdtemp`, mode
+ * 0700) that hold a live session's audio until its speaker pass ran. A fixed
+ * shared folder would let two vaults recording in the same minute open the
+ * same file, and a planted symlink redirect the write.
+ */
+export function liveAudioTempPrefix(): string {
+  return path.join(os.tmpdir(), "obsidian-meeting-transcriber-");
+}
+
+/** Whether `audioPath` lies in a folder this plugin created for a session. */
+export function isLiveAudioTempPath(audioPath: string): boolean {
+  const dir = path.dirname(audioPath);
+  const prefix = liveAudioTempPrefix();
+  return (
+    dir.startsWith(prefix) &&
+    dir.length > prefix.length &&
+    path.dirname(dir) === path.dirname(prefix)
+  );
+}
+
+/** Remove a session's audio file and its private folder. Never throws. */
+async function removeLiveAudio(audioPath: string): Promise<void> {
+  if (!isLiveAudioTempPath(audioPath)) return;
+  await fsp
+    .rm(path.dirname(audioPath), { recursive: true, force: true })
+    .catch(() => undefined);
+}
+
+/**
+ * More distinct voices than a meeting has. Automatic clustering that lands
+ * above this is cutting the dendrogram far too fine for the recording, and
+ * the labels would be noise; the caller keeps the plain transcript instead
+ * and tells the user which two settings fix it.
+ */
+export const MAX_PLAUSIBLE_SPEAKERS = 12;
+
+function implausibleSpeakerCountMessage(speakers: number): string {
+  return (
+    `Speaker detection found ${speakers} speakers, far more than a meeting ` +
+    "has, so no labels were applied. Raise 'Clustering threshold' in the " +
+    "plugin settings (try 0.8) or set 'Number of speakers' to the real " +
+    "count, then run 'Assign speakers to transcript'."
+  );
 }
 
 /** Suffix for a "done" Notice describing what the speaker pass found. */
@@ -593,7 +634,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     pluginDir: string,
     status: string,
     notice: Notice,
-  ): Promise<{ text: string; speakers: number }> {
+  ): Promise<{ text: string; speakers: number | null }> {
     const diarizationDir = this.resolveDiarizationModelDir();
     if (!diarizationDir) {
       throw new Error(
@@ -615,7 +656,19 @@ export default class MeetingTranscriberPlugin extends Plugin {
         report(total > 0 ? Math.round((processed / total) * 100) : null),
     );
     const result = speakerTranscript(structured.words, segments);
+    if (this.isImplausibleSpeakerCount(result.speakers)) {
+      new Notice(implausibleSpeakerCountMessage(result.speakers), 20000);
+      return { text: structured.text, speakers: null };
+    }
     return { text: result.text || structured.text, speakers: result.speakers };
+  }
+
+  /** Only automatic detection can overshoot; an exact count is the user's. */
+  private isImplausibleSpeakerCount(speakers: number): boolean {
+    return (
+      this.settings.diarizationNumSpeakers <= 0 &&
+      speakers > MAX_PLAUSIBLE_SPEAKERS
+    );
   }
 
   private async assignSpeakersActiveOrSuggested(): Promise<void> {
@@ -665,15 +718,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
         new Notice(`The recording ${audioPath} no longer exists.`, 10000);
         return null;
       }
-      const bytes = await fsp.readFile(audioPath);
-      const wav = decodeWavPcm16(
-        bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-      );
+      // Streamed and mixed to mono on the way in: a kept recording is a
+      // plugin WAV, and the command path labels every voice in it.
+      const wav = await readWavPcm16Channel(audioPath, "mix");
       if (!wav || wav.sampleRate !== 16000) {
         new Notice(`${audioPath} is not a 16 kHz PCM recording.`, 10000);
         return null;
       }
-      return wav.channels;
+      return [wav.samples];
     }
 
     const target = linkTargetFromFrontmatterValue(fm?.source);
@@ -715,10 +767,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
     const audioPath = linkTargetFromFrontmatterValue(fm?.audio);
     if (!audioPath || !path.isAbsolute(audioPath)) return;
-    const tempDir = liveAudioTempDir();
-    if (path.dirname(audioPath) === tempDir) {
-      await fsp.rm(audioPath, { force: true }).catch(() => undefined);
-    }
+    await removeLiveAudio(audioPath);
     await this.app.fileManager
       .processFrontMatter(file, (data) => {
         delete data.audio;
@@ -728,16 +777,39 @@ export default class MeetingTranscriberPlugin extends Plugin {
 
   /**
    * Create the temporary WAV a live session records into, outside the vault
-   * (a vault may be synced) and deleted once the speaker pass has run.
+   * (a vault may be synced), in a private folder of its own (see
+   * `liveAudioTempPrefix`), deleted once the speaker pass has run.
    */
   async openLiveAudioSink(
     note: TFile,
     channels: number,
   ): Promise<LiveAudioSink | null> {
-    const file = path.join(liveAudioTempDir(), `${note.basename}.wav`);
+    let dir: string | null = null;
     try {
-      return await WavFileWriter.open(file, 16000, channels);
+      dir = await fsp.mkdtemp(liveAudioTempPrefix());
+      const writer = await WavFileWriter.open(
+        path.join(dir, "recording.wav"),
+        16000,
+        channels,
+      );
+      const folder = dir;
+      // Aborting must take the private folder with the file.
+      return {
+        path: writer.path,
+        get failed() {
+          return writer.failed;
+        },
+        write: (lanes) => writer.write(lanes),
+        close: () => writer.close(),
+        abort: async () => {
+          await writer.abort().catch(() => undefined);
+          await fsp.rm(folder, { recursive: true, force: true }).catch(() => undefined);
+        },
+      };
     } catch (e) {
+      if (dir) {
+        await fsp.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      }
       new Notice(
         `Could not create the recording's audio file (${(e as Error).message}); ` +
           "speakers will not be assigned.",
@@ -767,8 +839,9 @@ export default class MeetingTranscriberPlugin extends Plugin {
         .catch(() => undefined);
       new Notice(
         `${why} The recording's audio was kept; run "Assign speakers to ` +
-          `transcript" on ${note.name} to retry.`,
-        15000,
+          `transcript" on ${note.name} to label it from that audio (this ` +
+          "replaces the transcript section).",
+        20000,
       );
     };
     const reason = this.diarizationUnavailableReason();
@@ -797,21 +870,32 @@ export default class MeetingTranscriberPlugin extends Plugin {
         done = true;
         return;
       }
-      const bytes = await fsp.readFile(source.audioPath);
-      const wav = decodeWavPcm16(
-        bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-      );
-      if (
-        !wav ||
-        wav.sampleRate !== 16000 ||
-        wav.channels.length < source.lanes.length
-      ) {
-        throw new Error("the kept audio could not be read");
+      if (raw !== source.expectedTranscript) {
+        // The note no longer holds only what the panel wrote: the user
+        // edited it during the recording. Rendering from the words would
+        // silently discard that work.
+        await keepForRetry(
+          `The transcript of ${note.name} was edited during the recording, ` +
+            "so the automatic speaker pass left it alone.",
+        );
+        return;
       }
       const diarizeLane = source.lanes.includes("others")
         ? "others"
         : source.lanes[0];
-      const pcm = wav.channels[source.lanes.indexOf(diarizeLane)];
+      // Only the diarized channel is decoded, streamed from disk.
+      const wav = await readWavPcm16Channel(
+        source.audioPath,
+        source.lanes.indexOf(diarizeLane),
+      );
+      if (
+        !wav ||
+        wav.sampleRate !== 16000 ||
+        wav.channels < source.lanes.length
+      ) {
+        throw new Error("the kept audio could not be read");
+      }
+      const pcm = wav.samples;
       const report = (pct: number | null) => {
         const suffix = pct === null ? "" : ` ${pct}%`;
         notice.messageEl.setText(`Assigning speakers…${suffix}`);
@@ -840,6 +924,11 @@ export default class MeetingTranscriberPlugin extends Plugin {
         done = true;
         return;
       }
+      if (this.isImplausibleSpeakerCount(result.speakers)) {
+        // Keep the audio: the fix is a settings change and a rerun.
+        await keepForRetry(implausibleSpeakerCountMessage(result.speakers));
+        return;
+      }
       let applied = false;
       await this.app.vault.process(note, (current) => {
         if (extractTranscriptSection(current) !== raw) return current;
@@ -861,9 +950,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     } catch (e) {
       await keepForRetry(`Speaker assignment failed: ${(e as Error).message}.`);
     } finally {
-      if (done) {
-        await fsp.rm(source.audioPath, { force: true }).catch(() => undefined);
-      }
+      if (done) await removeLiveAudio(source.audioPath);
       notice.hide();
       this.setStatus(status, "");
       this.diarizing.delete(note.path);

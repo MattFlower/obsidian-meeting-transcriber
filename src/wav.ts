@@ -102,26 +102,28 @@ function fourcc(view: DataView, offset: number): string {
   );
 }
 
+/** What the RIFF chunk walk found about a 16-bit PCM file. */
+export interface WavPcm16Header {
+  channels: number;
+  sampleRate: number;
+  /** Byte offset of the first sample. */
+  dataOffset: number;
+  /** Usable PCM bytes: the declared size, or what is present when it lies. */
+  dataBytes: number;
+}
+
 /**
- * Decode a 16-bit PCM WAV file into per-channel float samples.
- *
- * This is a pure RIFF chunk walk rather than a fixed 44-byte parse so that
- * files with extra chunks (LIST/INFO, fact, ...) in any order still decode;
- * chunks are word-aligned, so an odd-sized body is followed by a pad byte
- * that the size field does not count. Returns null for anything that is
- * not plain 16-bit PCM (8-bit, float, extensible, compressed) so the caller
- * can fall back to Web Audio decoding, which understands far more formats.
- *
- * A data size of 0, 0xFFFFFFFF or beyond the end of the file is treated as
- * "unknown" and the bytes actually present are used: that is what the
- * plugin's own writer leaves behind if the process dies before `close()`
- * patches the header, and those recordings are the ones worth rescuing.
+ * Walk the RIFF chunks in the first `length` bytes of `view` and describe
+ * the PCM data. `totalLength` is the file's real size, which decides how
+ * many bytes are usable when the data size field is 0, 0xFFFFFFFF or larger
+ * than the file. Returns null unless the file is plain 16-bit PCM and both
+ * the `fmt ` chunk and the `data` chunk header lie within `length`.
  */
-export function decodeWavPcm16(
-  bytes: ArrayBuffer,
-): { channels: Float32Array[]; sampleRate: number } | null {
-  const view = new DataView(bytes);
-  const length = bytes.byteLength;
+export function parseWavPcm16Header(
+  view: DataView,
+  length: number,
+  totalLength: number,
+): WavPcm16Header | null {
   if (length < 12) return null;
   if (fourcc(view, 0) !== "RIFF" || fourcc(view, 8) !== "WAVE") return null;
 
@@ -147,9 +149,11 @@ export function decodeWavPcm16(
         bitsPerSample: view.getUint16(body + 14, true),
       };
     } else if (id === "data") {
-      const available = length - body;
-      const usable = size === 0 || size > available ? available : size;
-      data = { offset: body, size: usable };
+      const available = Math.max(0, totalLength - body);
+      const lying = size === 0 || size > available;
+      data = { offset: body, size: lying ? available : size };
+      // A lying size means the file ends in this chunk: nothing follows.
+      if (lying) break;
     }
     // Word alignment: skip the pad byte after an odd-sized body.
     pos = body + size + (size & 1);
@@ -158,6 +162,118 @@ export function decodeWavPcm16(
   if (!fmt || !data) return null;
   if (fmt.audioFormat !== 1 || fmt.bitsPerSample !== 16) return null;
   if (fmt.channels < 1 || fmt.sampleRate < 1) return null;
+  return {
+    channels: fmt.channels,
+    sampleRate: fmt.sampleRate,
+    dataOffset: data.offset,
+    dataBytes: data.size,
+  };
+}
+
+export interface ReadWavOptions {
+  /** Bytes read per step (default 1 MiB); tests use small values. */
+  blockBytes?: number;
+  /** Bytes scanned for the chunk headers (default 64 KiB). */
+  headerBytes?: number;
+}
+
+/**
+ * Read one channel (or the average of all channels, `"mix"`) of a 16-bit
+ * PCM WAV file straight from disk into a Float32Array, block by block. An
+ * hour of the plugin's own stereo recording is 230 MB on disk; loading it
+ * whole and decoding every channel would take roughly four times that in
+ * the renderer for a pass that only needs one channel. Returns null when
+ * the file is not plain 16-bit PCM or its header is not found in the first
+ * `headerBytes`.
+ */
+export async function readWavPcm16Channel(
+  absPath: string,
+  channel: number | "mix",
+  opts: ReadWavOptions = {},
+): Promise<{ samples: Float32Array; sampleRate: number; channels: number } | null> {
+  const handle = await fsp.open(absPath, "r");
+  try {
+    const { size: fileSize } = await handle.stat();
+    const headerBytes = Math.min(fileSize, opts.headerBytes ?? 65536);
+    const head = Buffer.alloc(headerBytes);
+    await handle.read(head, 0, headerBytes, 0);
+    const info = parseWavPcm16Header(
+      new DataView(head.buffer, head.byteOffset, headerBytes),
+      headerBytes,
+      fileSize,
+    );
+    if (!info) return null;
+    if (channel !== "mix" && (channel < 0 || channel >= info.channels)) {
+      throw new RangeError(
+        `readWavPcm16Channel: channel ${channel} of ${info.channels}`,
+      );
+    }
+
+    const frameBytes = info.channels * 2;
+    const frames = Math.floor(info.dataBytes / frameBytes);
+    const samples = new Float32Array(frames);
+    const blockFrames = Math.max(
+      1,
+      Math.floor((opts.blockBytes ?? 1 << 20) / frameBytes),
+    );
+    const block = Buffer.alloc(blockFrames * frameBytes);
+    const scale = 1 / (32768 * (channel === "mix" ? info.channels : 1));
+    let frame = 0;
+    let filePos = info.dataOffset;
+    while (frame < frames) {
+      const want = Math.min(blockFrames, frames - frame);
+      const { bytesRead } = await handle.read(block, 0, want * frameBytes, filePos);
+      const got = Math.floor(bytesRead / frameBytes);
+      if (got === 0) break;
+      for (let i = 0; i < got; i++) {
+        const base = i * frameBytes;
+        if (channel === "mix") {
+          let sum = 0;
+          for (let c = 0; c < info.channels; c++) {
+            sum += block.readInt16LE(base + 2 * c);
+          }
+          samples[frame + i] = sum * scale;
+        } else {
+          samples[frame + i] = block.readInt16LE(base + 2 * channel) * scale;
+        }
+      }
+      frame += got;
+      filePos += got * frameBytes;
+    }
+    return {
+      samples: frame === frames ? samples : samples.subarray(0, frame),
+      sampleRate: info.sampleRate,
+      channels: info.channels,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Decode a 16-bit PCM WAV file into per-channel float samples.
+ *
+ * This is a pure RIFF chunk walk rather than a fixed 44-byte parse so that
+ * files with extra chunks (LIST/INFO, fact, ...) in any order still decode;
+ * chunks are word-aligned, so an odd-sized body is followed by a pad byte
+ * that the size field does not count. Returns null for anything that is
+ * not plain 16-bit PCM (8-bit, float, extensible, compressed) so the caller
+ * can fall back to Web Audio decoding, which understands far more formats.
+ *
+ * A data size of 0, 0xFFFFFFFF or beyond the end of the file is treated as
+ * "unknown" and the bytes actually present are used: that is what the
+ * plugin's own writer leaves behind if the process dies before `close()`
+ * patches the header, and those recordings are the ones worth rescuing.
+ */
+export function decodeWavPcm16(
+  bytes: ArrayBuffer,
+): { channels: Float32Array[]; sampleRate: number } | null {
+  const view = new DataView(bytes);
+  const length = bytes.byteLength;
+  const info = parseWavPcm16Header(view, length, length);
+  if (!info) return null;
+  const fmt = info;
+  const data = { offset: info.dataOffset, size: info.dataBytes };
 
   const frameBytes = fmt.channels * 2;
   const frames = Math.floor(data.size / frameBytes);
@@ -265,7 +381,12 @@ export class WavFileWriter {
     deps?: WavWriterDeps,
   ): Promise<WavFileWriter> {
     await fsp.mkdir(dirname(absPath), { recursive: true });
-    const create = deps?.createStream ?? ((p: string) => createWriteStream(p));
+    // Exclusive create, owner-only: the file must not exist yet (so a
+    // symlink planted in a shared temp directory cannot redirect the write)
+    // and nobody else on the machine can read the recording.
+    const create =
+      deps?.createStream ??
+      ((p: string) => createWriteStream(p, { flags: "wx", mode: 0o600 }));
     const stream = create(absPath);
     const writer = new WavFileWriter(absPath, sampleRate, channels, stream);
     try {

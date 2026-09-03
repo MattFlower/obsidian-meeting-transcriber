@@ -115,11 +115,40 @@ export interface OfflineStreamLike {
   acceptWaveform(waveform: { samples: Float32Array; sampleRate: number }): void;
 }
 
+/**
+ * The fields of sherpa-onnx's offline recognition result this module reads.
+ * `tokens` are SentencePiece pieces (a piece that starts with a space or
+ * "\u2581" begins a word) and `timestamps` their start times in seconds,
+ * relative to the audio handed to the stream; `durations` is empty for the
+ * Parakeet TDT export. All are optional: a fake or older addon may return
+ * `{ text }` only.
+ */
+export interface OfflineRecognitionResultLike {
+  text?: string;
+  tokens?: string[];
+  timestamps?: number[];
+  durations?: number[];
+}
+
 export interface OfflineRecognizerLike {
   createStream(): OfflineStreamLike;
   decodeAsync(
     stream: OfflineStreamLike,
-  ): Promise<{ text?: string } | null | undefined>;
+  ): Promise<OfflineRecognitionResultLike | null | undefined>;
+}
+
+/** One recognized word with its time span in seconds. */
+export interface TimedWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
+/** Transcript text plus the words it was assembled from (empty when the
+ * recognizer reported no timestamps). */
+export interface StructuredTranscript {
+  text: string;
+  words: TimedWord[];
 }
 
 interface RecognizerHolder {
@@ -212,6 +241,93 @@ export function releaseRecognizer(): void {
   holder = null;
 }
 
+// ---------------------------------------------------------------------------
+// Words and timestamps
+// ---------------------------------------------------------------------------
+
+/**
+ * Group the recognizer's SentencePiece tokens into words with a time span
+ * each. A piece that begins with a space or "▁" starts a word; any other
+ * piece (a suffix, punctuation, an apostrophe) extends the current one. The
+ * start is the first piece's timestamp. Parakeet's export reports no
+ * durations, so a word ends where the next word starts, capped at
+ * `maxWordSeconds` so a long pause is not counted as speech, and at
+ * `totalSeconds` for the last word. When durations are present they win.
+ *
+ * Returns `[]` when the arrays are absent or inconsistent: the transcript text
+ * is still usable, only speaker alignment is not. Pure so it can be tested.
+ */
+export function wordsFromTokens(
+  tokens: readonly string[] | undefined,
+  timestamps: readonly number[] | undefined,
+  durations: readonly number[] | undefined,
+  totalSeconds: number,
+  maxWordSeconds = 1,
+): TimedWord[] {
+  if (!tokens || !timestamps) return [];
+  if (tokens.length === 0 || tokens.length !== timestamps.length) return [];
+  const hasDurations =
+    durations !== undefined && durations.length === tokens.length;
+
+  interface Group {
+    text: string;
+    start: number;
+    last: number;
+  }
+  const groups: Group[] = [];
+  // A piece that is only a space carries no text but still marks a boundary.
+  let pendingBoundary = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const raw = tokens[i] ?? "";
+    const marksBoundary = /^[ ▁]/.test(raw);
+    const piece = raw.replace(/^[ ▁]+/, "");
+    if (piece.length === 0) {
+      pendingBoundary = pendingBoundary || marksBoundary;
+      continue;
+    }
+    const startsWord = marksBoundary || pendingBoundary;
+    pendingBoundary = false;
+    const current = groups[groups.length - 1];
+    if (startsWord || !current) {
+      groups.push({ text: piece, start: timestamps[i], last: i });
+    } else {
+      current.text += piece;
+      current.last = i;
+    }
+  }
+
+  const words: TimedWord[] = [];
+  for (let g = 0; g < groups.length; g++) {
+    const { text, start, last } = groups[g];
+    const nextStart = g + 1 < groups.length ? groups[g + 1].start : Infinity;
+    const duration = hasDurations ? durations[last] : 0;
+    let end =
+      duration > 0
+        ? timestamps[last] + duration
+        : Math.min(nextStart, start + maxWordSeconds);
+    if (Number.isFinite(totalSeconds)) end = Math.min(end, totalSeconds);
+    if (!(end >= start)) end = start;
+    words.push({ text, start, end });
+  }
+  return words;
+}
+
+// ---------------------------------------------------------------------------
+// Decoding
+// ---------------------------------------------------------------------------
+
+async function decode(
+  pcm: Float32Array,
+  modelDir: string,
+  pluginDir: string,
+  sampleRate: number,
+): Promise<OfflineRecognitionResultLike | null | undefined> {
+  const recognizer = await getRecognizer(modelDir, pluginDir);
+  const stream = recognizer.createStream();
+  stream.acceptWaveform({ samples: pcm, sampleRate });
+  return recognizer.decodeAsync(stream);
+}
+
 /**
  * Transcribe 16 kHz mono PCM samples into text using the Parakeet model in
  * `modelDir`.
@@ -234,9 +350,132 @@ export async function transcribe(
   pluginDir: string,
   sampleRate = 16000,
 ): Promise<string> {
-  const recognizer = await getRecognizer(modelDir, pluginDir);
-  const stream = recognizer.createStream();
-  stream.acceptWaveform({ samples: pcm, sampleRate });
-  const result = await recognizer.decodeAsync(stream);
+  const result = await decode(pcm, modelDir, pluginDir, sampleRate);
   return (result?.text ?? "").trim();
+}
+
+/**
+ * Like `transcribe`, but also returns the words with their time spans (see
+ * `wordsFromTokens`), relative to the start of `pcm`. The speaker pass aligns
+ * these against diarization segments; the text itself is the recognizer's
+ * own, unchanged.
+ */
+export async function transcribeWithTimestamps(
+  pcm: Float32Array,
+  modelDir: string,
+  pluginDir: string,
+  sampleRate = 16000,
+): Promise<StructuredTranscript> {
+  const result = await decode(pcm, modelDir, pluginDir, sampleRate);
+  const text = (result?.text ?? "").trim();
+  const words = wordsFromTokens(
+    result?.tokens,
+    result?.timestamps,
+    result?.durations,
+    pcm.length / sampleRate,
+  );
+  return { text, words };
+}
+
+// ---------------------------------------------------------------------------
+// Long audio
+// ---------------------------------------------------------------------------
+
+/**
+ * Boundaries for decoding long audio in windows of at most `maxSeconds`:
+ * `[0, cut1, cut2, …, pcm.length]`. Each cut lands on the quietest 100 ms
+ * (lowest energy, 20 ms hop) within the `searchSeconds` before the window
+ * limit, so a window rarely ends mid-word and the windows need no overlap.
+ * Parakeet's full attention is quadratic in the input length, which is why
+ * an hour-long recording is not decoded in one pass. Pure so it can be tested.
+ */
+export function splitAtQuietPoints(
+  pcm: Float32Array,
+  sampleRate: number,
+  maxSeconds = 600,
+  searchSeconds = 15,
+): number[] {
+  const maxSamples = Math.max(1, Math.floor(maxSeconds * sampleRate));
+  const searchSamples = Math.max(0, Math.floor(searchSeconds * sampleRate));
+  const rmsWindow = Math.max(1, Math.round(0.1 * sampleRate));
+  const hop = Math.max(1, Math.round(0.02 * sampleRate));
+
+  const bounds = [0];
+  let offset = 0;
+  while (pcm.length - offset > maxSamples) {
+    const target = offset + maxSamples;
+    const from = Math.max(offset + 1, target - searchSamples);
+    let bestCut = target;
+    let bestEnergy = Infinity;
+    for (let s = from; s + rmsWindow <= target; s += hop) {
+      let energy = 0;
+      for (let i = s; i < s + rmsWindow; i++) energy += pcm[i] * pcm[i];
+      if (energy < bestEnergy) {
+        bestEnergy = energy;
+        bestCut = s + (rmsWindow >> 1);
+      }
+    }
+    bounds.push(bestCut);
+    offset = bestCut;
+  }
+  bounds.push(pcm.length);
+  return bounds;
+}
+
+export interface LongTranscribeOptions {
+  /** Longest window decoded in one pass (default 600 s). */
+  maxSeconds?: number;
+  /** How far before the window limit to look for a quiet cut (default 15 s). */
+  searchSeconds?: number;
+  /** Called after each window: windows done so far, and the total. */
+  onProgress?: (done: number, total: number) => void;
+}
+
+/**
+ * `transcribeWithTimestamps` over `splitAtQuietPoints` windows, with word
+ * times shifted to the whole recording and the window texts joined by a
+ * space. Used when a whole recording (a kept live WAV, a long file) must be
+ * re-transcribed with timestamps.
+ */
+export async function transcribeLongWithTimestamps(
+  pcm: Float32Array,
+  modelDir: string,
+  pluginDir: string,
+  sampleRate = 16000,
+  opts: LongTranscribeOptions = {},
+): Promise<StructuredTranscript> {
+  const bounds = splitAtQuietPoints(
+    pcm,
+    sampleRate,
+    opts.maxSeconds,
+    opts.searchSeconds,
+  );
+  const total = bounds.length - 1;
+  const texts: string[] = [];
+  const words: TimedWord[] = [];
+  for (let w = 0; w < total; w++) {
+    const from = bounds[w];
+    const to = bounds[w + 1];
+    if (to > from) {
+      // A copy rather than a subarray view: the native addon reads the
+      // typed array from its own start.
+      const part = await transcribeWithTimestamps(
+        pcm.slice(from, to),
+        modelDir,
+        pluginDir,
+        sampleRate,
+      );
+      const offset = from / sampleRate;
+      if (part.text) texts.push(part.text);
+      for (const word of part.words) {
+        words.push({
+          text: word.text,
+          start: word.start + offset,
+          end: word.end + offset,
+        });
+      }
+    }
+    opts.onProgress?.(w + 1, total);
+  }
+  return { text: texts.join(" "), words };
 }

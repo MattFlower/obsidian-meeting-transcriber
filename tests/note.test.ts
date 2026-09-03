@@ -15,6 +15,8 @@ import {
   sanitizeFileName,
   splitFrontmatter,
   transcriptionNoteContent,
+  linkTargetFromFrontmatterValue,
+  appendTurnsToTranscriptSection,
 } from "../src/note";
 
 const sampleNote = transcriptionNoteContent({
@@ -445,5 +447,77 @@ describe("replaceTranscriptSection", () => {
     expect(extractTranscriptSection(sampleNote)).toBe(
       "Alice: Let's ship it.\nBob: Agreed.",
     );
+  });
+});
+
+describe("linkTargetFromFrontmatterValue", () => {
+  it("strips the brackets from a quoted wiki link", () => {
+    expect(linkTargetFromFrontmatterValue("[[Meetings/call.m4a]]")).toBe(
+      "Meetings/call.m4a",
+    );
+  });
+
+  it("drops an alias and a heading", () => {
+    expect(linkTargetFromFrontmatterValue("[[a/b.wav|the call]]")).toBe("a/b.wav");
+    expect(linkTargetFromFrontmatterValue("[[a/b.wav#part]]")).toBe("a/b.wav");
+  });
+
+  it("unwraps the flow-list forms an unquoted link parses into", () => {
+    // The plugin's own parser: `[[x]]` -> ["[x]"].
+    expect(linkTargetFromFrontmatterValue(["[a/b.wav]"])).toBe("a/b.wav");
+    // A YAML parser: `[[x]]` -> [["x"]].
+    expect(linkTargetFromFrontmatterValue([["a/b.wav"]])).toBe("a/b.wav");
+  });
+
+  it("returns a plain path unchanged and null for anything else", () => {
+    expect(linkTargetFromFrontmatterValue("/tmp/x.wav")).toBe("/tmp/x.wav");
+    expect(linkTargetFromFrontmatterValue("  ")).toBeNull();
+    expect(linkTargetFromFrontmatterValue(undefined)).toBeNull();
+    expect(linkTargetFromFrontmatterValue(42)).toBeNull();
+    expect(linkTargetFromFrontmatterValue("[[]]")).toBeNull();
+  });
+});
+
+describe("appendTurnsToTranscriptSection", () => {
+  const base = "---\ntags: []\n---\n\n# T\n\n## Transcript\n";
+
+  it("appends labelled turns as paragraphs and continues a matching last paragraph", () => {
+    let md = appendTurnsToTranscriptSection(base, [
+      { speaker: "Me", text: "hello" },
+      { speaker: "Others", text: "hi there" },
+    ]);
+    expect(extractTranscriptSection(md)).toBe(
+      "**Me:** hello\n\n**Others:** hi there",
+    );
+    md = appendTurnsToTranscriptSection(md, [
+      { speaker: "Others", text: "how are you" },
+      { speaker: "Me", text: "fine" },
+    ]);
+    expect(extractTranscriptSection(md)).toBe(
+      "**Me:** hello\n\n**Others:** hi there how are you\n\n**Me:** fine",
+    );
+  });
+
+  it("appends unlabelled turns as plain paragraphs and skips blank ones", () => {
+    const md = appendTurnsToTranscriptSection(base, [
+      { speaker: "", text: "one" },
+      { speaker: "", text: "  " },
+      { speaker: "", text: "two" },
+    ]);
+    expect(extractTranscriptSection(md)).toBe("one\n\ntwo");
+    expect(appendTurnsToTranscriptSection(md, [])).toBe(md);
+  });
+
+  it("continues only within the transcript section and only under the same label", () => {
+    const withSummary =
+      base + "\n**Me:** hello\n\n## Summary\n\n**Me:** not transcript\n";
+    const md = appendTurnsToTranscriptSection(withSummary, [
+      { speaker: "Me", text: "again" },
+      { speaker: "Alice", text: "new voice" },
+    ]);
+    expect(extractTranscriptSection(md)).toBe(
+      "**Me:** hello again\n\n**Alice:** new voice",
+    );
+    expect(md).toContain("## Summary\n\n**Me:** not transcript");
   });
 });

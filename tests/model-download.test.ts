@@ -7,6 +7,8 @@ import {
   MODEL_REPO,
   downloadModel,
   modelFileUrls,
+  diarizationModelEntries,
+  downloadFileSet,
 } from "../src/model-download";
 
 describe("MODEL_FILES", () => {
@@ -39,6 +41,61 @@ describe("modelFileUrls", () => {
     expect(urls[1]).toBe(
       "https://huggingface.co/me/my-model/resolve/main/decoder.int8.onnx",
     );
+  });
+});
+
+describe("diarizationModelEntries", () => {
+  it("fetches the two diarization models and renames the segmentation file", () => {
+    expect(diarizationModelEntries()).toEqual([
+      {
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.int8.onnx",
+        file: "pyannote-segmentation-3-0.int8.onnx",
+      },
+      {
+        url: "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/nemo_en_titanet_small.onnx",
+        file: "nemo_en_titanet_small.onnx",
+      },
+    ]);
+  });
+});
+
+describe("downloadFileSet", () => {
+  it("saves each entry under its destination name and numbers progress over the set", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "fileset-"));
+    const fetched: string[] = [];
+    const fakeFetch = (async (url: string) => {
+      fetched.push(url);
+      return new Response(`body of ${url}`, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const progress: { file: string; index: number; count: number }[] = [];
+    await downloadFileSet(
+      [
+        { url: "https://example.test/a/model.int8.onnx", file: "renamed.onnx" },
+        { url: "https://example.test/b/kept.onnx", file: "kept.onnx" },
+      ],
+      dir,
+      (p) => progress.push({ file: p.file, index: p.index, count: p.count }),
+      fakeFetch,
+      { minProgressIntervalMs: 0 },
+    );
+
+    expect(fetched).toEqual([
+      "https://example.test/a/model.int8.onnx",
+      "https://example.test/b/kept.onnx",
+    ]);
+    expect((await readdir(dir)).sort()).toEqual(["kept.onnx", "renamed.onnx"]);
+    expect(await readFile(path.join(dir, "renamed.onnx"), "utf8")).toBe(
+      "body of https://example.test/a/model.int8.onnx",
+    );
+    expect(progress[0]).toEqual({ file: "renamed.onnx", index: 0, count: 2 });
+    expect(progress[progress.length - 1]).toEqual({
+      file: "kept.onnx",
+      index: 1,
+      count: 2,
+    });
+
+    await rm(dir, { recursive: true, force: true });
   });
 });
 

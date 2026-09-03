@@ -4,6 +4,8 @@ import { once } from "node:events";
 import { finished } from "node:stream/promises";
 import * as path from "node:path";
 
+import { DIARIZATION_MODEL_FILE_NAMES } from "./diarize";
+
 /** Hugging Face repo hosting the Parakeet TDT 0.6B v2 int8 ONNX model. */
 export const MODEL_REPO =
   "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8";
@@ -22,9 +24,47 @@ export type ModelFile = (typeof MODEL_FILES)[number];
  * Build the download URLs for every model file. Pure so it can be tested.
  */
 export function modelFileUrls(repoId: string = MODEL_REPO): string[] {
-  return MODEL_FILES.map(
-    (f) => `https://huggingface.co/${repoId}/resolve/main/${f}`,
-  );
+  return MODEL_FILES.map((f) => huggingFaceFileUrl(repoId, f));
+}
+
+export function huggingFaceFileUrl(repoId: string, file: string): string {
+  return `https://huggingface.co/${repoId}/resolve/main/${file}`;
+}
+
+/** One file to fetch: its URL and the name it is saved under. */
+export interface DownloadEntry {
+  url: string;
+  file: string;
+}
+
+/** The Parakeet files as download entries (destination names unchanged). */
+export function parakeetModelEntries(repoId: string = MODEL_REPO): DownloadEntry[] {
+  return MODEL_FILES.map((f) => ({ url: huggingFaceFileUrl(repoId, f), file: f }));
+}
+
+/**
+ * The two diarization models. The segmentation file is renamed on download
+ * because its upstream name (`model.int8.onnx`) says nothing about what it
+ * is once it sits next to other models; the embedding file keeps its name.
+ */
+export const DIARIZATION_MODEL_SOURCES = [
+  {
+    repo: "csukuangfj/sherpa-onnx-pyannote-segmentation-3-0",
+    remote: "model.int8.onnx",
+    file: DIARIZATION_MODEL_FILE_NAMES.segmentation,
+  },
+  {
+    repo: "csukuangfj/speaker-embedding-models",
+    remote: "nemo_en_titanet_small.onnx",
+    file: DIARIZATION_MODEL_FILE_NAMES.embedding,
+  },
+] as const;
+
+export function diarizationModelEntries(): DownloadEntry[] {
+  return DIARIZATION_MODEL_SOURCES.map((m) => ({
+    url: huggingFaceFileUrl(m.repo, m.remote),
+    file: m.file,
+  }));
 }
 
 export interface DownloadProgress {
@@ -144,11 +184,12 @@ async function downloadOne(
 }
 
 /**
- * Download all model files into `destDir`, streaming each to disk and
+ * Download every entry into `destDir` in order, streaming each to disk and
  * reporting incremental progress via `onProgress`. `fetchImpl` is injectable
  * for tests; `options` tunes progress throttling.
  */
-export async function downloadModel(
+export async function downloadFileSet(
+  entries: readonly DownloadEntry[],
   destDir: string,
   onProgress?: (p: DownloadProgress) => void,
   fetchImpl?: typeof fetch,
@@ -160,18 +201,49 @@ export async function downloadModel(
       options?.minProgressIntervalMs ?? DEFAULT_PROGRESS_INTERVAL_MS,
     now: options?.now ?? (() => Date.now()),
   };
-  const urls = modelFileUrls();
-  for (let i = 0; i < MODEL_FILES.length; i++) {
-    const file = MODEL_FILES[i];
+  for (let i = 0; i < entries.length; i++) {
+    const { url, file } = entries[i];
     await downloadOne(
-      urls[i],
+      url,
       path.join(destDir, file),
       file,
       i,
-      MODEL_FILES.length,
+      entries.length,
       onProgress,
       fetchImpl ?? fetch,
       throttle,
     );
   }
+}
+
+/** Download the Parakeet model files into `destDir`. */
+export async function downloadModel(
+  destDir: string,
+  onProgress?: (p: DownloadProgress) => void,
+  fetchImpl?: typeof fetch,
+  options?: DownloadOptions,
+): Promise<void> {
+  await downloadFileSet(
+    parakeetModelEntries(),
+    destDir,
+    onProgress,
+    fetchImpl,
+    options,
+  );
+}
+
+/** Download the two diarization models into `destDir`. */
+export async function downloadDiarizationModels(
+  destDir: string,
+  onProgress?: (p: DownloadProgress) => void,
+  fetchImpl?: typeof fetch,
+  options?: DownloadOptions,
+): Promise<void> {
+  await downloadFileSet(
+    diarizationModelEntries(),
+    destDir,
+    onProgress,
+    fetchImpl,
+    options,
+  );
 }

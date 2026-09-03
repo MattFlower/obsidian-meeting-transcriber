@@ -51,6 +51,34 @@ export interface TranscriberSettings {
   normalizeFileTranscripts: boolean;
   /** Normalize a live recording's note once the session stops. */
   normalizeLiveOnStop: boolean;
+  /** Master switch for speaker diarization (speaker labels in transcripts). */
+  diarizationEnabled: boolean;
+  /** Vault-relative directory holding the two diarization ONNX models. */
+  diarizationModelDir: string;
+  /** Exact number of speakers to cluster into; 0 detects it automatically. */
+  diarizationNumSpeakers: number;
+  /** Clustering threshold used when the speaker count is detected (0.05–1.5). */
+  diarizationThreshold: number;
+  /** Run the speaker pass on a live recording's note once the session stops. */
+  diarizeLiveOnStop: boolean;
+}
+
+export const DIARIZATION_THRESHOLD_MIN = 0.05;
+export const DIARIZATION_THRESHOLD_MAX = 1.5;
+
+/** Clamp a threshold setting into its valid range, defaulting when unparsable. */
+export function clampDiarizationThreshold(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_SETTINGS.diarizationThreshold;
+  return Math.min(
+    DIARIZATION_THRESHOLD_MAX,
+    Math.max(DIARIZATION_THRESHOLD_MIN, value),
+  );
+}
+
+/** A speaker count is a non-negative integer; anything else means "detect". */
+export function clampDiarizationNumSpeakers(value: number): number {
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.floor(value);
 }
 
 export const DEFAULT_SETTINGS: TranscriberSettings = {
@@ -74,6 +102,11 @@ export const DEFAULT_SETTINGS: TranscriberSettings = {
   normalizerStructure: "prose",
   normalizeFileTranscripts: true,
   normalizeLiveOnStop: true,
+  diarizationEnabled: false,
+  diarizationModelDir: "models/diarization",
+  diarizationNumSpeakers: 0,
+  diarizationThreshold: 0.5,
+  diarizeLiveOnStop: true,
 };
 
 export class TranscriberSettingTab extends PluginSettingTab {
@@ -265,6 +298,7 @@ export class TranscriberSettingTab extends PluginSettingTab {
         dropdown
           .addOption("microphone", "Microphone")
           .addOption("system", "System audio")
+          .addOption("both", "Microphone + system audio")
           .setValue(this.plugin.settings.liveAudioSource)
           .onChange(async (value) => {
             this.plugin.settings.liveAudioSource = value as LiveAudioSource;
@@ -291,6 +325,98 @@ export class TranscriberSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    new Setting(containerEl)
+      .setName("Assign speakers to transcripts")
+      .setDesc(
+        "Label who is speaking (Speaker 1, Speaker 2, …) with a local " +
+          "speaker diarization model (pyannote segmentation and NeMo " +
+          "TitaNet embeddings through sherpa-onnx). Runs after a file is " +
+          "transcribed and, optionally, after a live recording stops; the " +
+          "'Assign speakers to transcript' command runs it on demand. " +
+          "Requires the 'Download diarization models' command (about 42 MB).",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.diarizationEnabled)
+          .onChange(async (value) => {
+            this.plugin.settings.diarizationEnabled = value;
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+
+    if (this.plugin.settings.diarizationEnabled) {
+      new Setting(containerEl)
+        .setName("Diarization model directory")
+        .setDesc(
+          "Vault-relative folder holding the segmentation and embedding " +
+            "models (created by the download command).",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("models/diarization")
+            .setValue(this.plugin.settings.diarizationModelDir)
+            .onChange(async (value) => {
+              this.plugin.settings.diarizationModelDir =
+                value.trim() || "models/diarization";
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("Number of speakers")
+        .setDesc(
+          "0 detects the number of speakers automatically. Any other value " +
+            "is used as the exact number of speakers, not a maximum: set it " +
+            "only when you know how many people spoke.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("0")
+            .setValue(String(this.plugin.settings.diarizationNumSpeakers))
+            .onChange(async (value) => {
+              this.plugin.settings.diarizationNumSpeakers =
+                clampDiarizationNumSpeakers(parseInt(value, 10));
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("Clustering threshold")
+        .setDesc(
+          "Used when the speaker count is detected automatically (default " +
+            "0.5). Raise it if one person is split into several speakers; " +
+            "lower it if two people are merged into one.",
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("0.5")
+            .setValue(String(this.plugin.settings.diarizationThreshold))
+            .onChange(async (value) => {
+              this.plugin.settings.diarizationThreshold =
+                clampDiarizationThreshold(parseFloat(value));
+              await this.plugin.saveSettings();
+            }),
+        );
+
+      new Setting(containerEl)
+        .setName("Assign speakers to live recordings when they stop")
+        .setDesc(
+          "While a live session runs, its audio is written to a temporary " +
+            "WAV file outside the vault (about 115 MB per hour). When the " +
+            "session stops the speaker pass runs on it and the file is " +
+            "deleted. Paused spans are not recorded.",
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.diarizeLiveOnStop)
+            .onChange(async (value) => {
+              this.plugin.settings.diarizeLiveOnStop = value;
+              await this.plugin.saveSettings();
+            }),
+        );
+    }
 
     new Setting(containerEl)
       .setName("Normalize transcripts with S1-mini by Superwhisper")

@@ -119,6 +119,32 @@ export function emitFrontmatter(data: FrontmatterData): string {
   return lines.join("\n");
 }
 
+/**
+ * The link target inside a frontmatter value such as `"[[Meetings/a.m4a|call]]"`,
+ * without the brackets, alias or heading. The value may also arrive as an
+ * array: YAML reads an unquoted `[[x]]` as a nested flow sequence, and the
+ * plugin's own `parseFrontmatter` turns it into `["[x]"]`; both are
+ * unwrapped to their first string. A plain path is returned as it is.
+ * Returns null for anything that is not a non-empty string. Pure so it can
+ * be tested.
+ */
+export function linkTargetFromFrontmatterValue(value: unknown): string | null {
+  let current: unknown = value;
+  while (Array.isArray(current)) current = current[0];
+  if (typeof current !== "string") return null;
+  let text = current.trim();
+  while (text.startsWith("[") && text.endsWith("]")) {
+    text = text.slice(1, -1).trim();
+  }
+  text = text.replace(/^\[+/, "").replace(/\]+$/, "");
+  const alias = text.indexOf("|");
+  if (alias !== -1) text = text.slice(0, alias);
+  const heading = text.indexOf("#");
+  if (heading !== -1) text = text.slice(0, heading);
+  text = text.trim();
+  return text.length > 0 ? text : null;
+}
+
 export interface TranscriptionNoteInput {
   title: string;
   date: string;
@@ -297,6 +323,62 @@ export function appendToTranscriptSection(
       ? [lines[headingIdx], "", trimmed]
       : [lines[headingIdx], "", ...existing, "", trimmed];
   return [...before, ...section, "", ...after].join("\n");
+}
+
+/** A speaker turn as the live panel appends it: label ("" = none) and text. */
+export interface TranscriptTurn {
+  speaker: string;
+  text: string;
+}
+
+/**
+ * Append speaker turns to the `## Transcript` section. A labelled turn
+ * whose label matches the section's last paragraph continues that
+ * paragraph (one speaker talking across two windows stays one paragraph);
+ * any other turn becomes a new `**Label:** text` paragraph, and an
+ * unlabelled turn a plain paragraph exactly as `appendToTranscriptSection`
+ * would add it. Pure so it can be tested.
+ */
+export function appendTurnsToTranscriptSection(
+  markdown: string,
+  turns: TranscriptTurn[],
+): string {
+  let out = markdown;
+  for (const turn of turns) {
+    const text = turn.text.trim();
+    if (!text) continue;
+    if (!turn.speaker) {
+      out = appendToTranscriptSection(out, text);
+      continue;
+    }
+    const continued = continueLastParagraph(out, turn.speaker, text);
+    out =
+      continued ?? appendToTranscriptSection(out, `**${turn.speaker}:** ${text}`);
+  }
+  return out;
+}
+
+/**
+ * Append `text` to the transcript section's last paragraph when that
+ * paragraph opens with `**label:**`; null when it does not (or there is no
+ * section), so the caller starts a new paragraph instead.
+ */
+function continueLastParagraph(
+  markdown: string,
+  label: string,
+  text: string,
+): string | null {
+  const lines = markdown.split("\n");
+  const bounds = findTranscriptSection(lines);
+  if (!bounds) return null;
+  let last = bounds.end - 1;
+  while (last > bounds.headingIdx && lines[last].trim() === "") last--;
+  if (last === bounds.headingIdx) return null;
+  let first = last;
+  while (first - 1 > bounds.headingIdx && lines[first - 1].trim() !== "") first--;
+  if (!lines[first].startsWith(`**${label}:**`)) return null;
+  lines[last] = `${lines[last].replace(/\s+$/, "")} ${text}`;
+  return lines.join("\n");
 }
 
 /**

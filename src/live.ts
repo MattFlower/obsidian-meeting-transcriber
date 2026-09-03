@@ -11,7 +11,114 @@
  * requires `sherpa-onnx-node`) lives in the panel's pump.
  */
 
-export type LiveAudioSource = "microphone" | "system";
+import type { TimedWord } from "./transcriber";
+
+export type LiveAudioSource = "microphone" | "system" | "both";
+
+/**
+ * A lane is one captured input. A single-source session has one `mixed`
+ * lane; a `"both"` session captures the microphone as `me` and the loopback
+ * device as `others`, sample-aligned because one worklet reads both.
+ */
+export type LiveLane = "mixed" | "me" | "others";
+
+/** Samples per lane cut from the same render quanta (equal lengths). */
+export type LiveFrame = Partial<Record<LiveLane, Float32Array>>;
+
+/** One transcription window: a chunk per lane cut from the same samples. */
+export interface LiveWindow {
+  /** 0-based sequence number within the session. */
+  index: number;
+  /** Where the window starts in the session's unpaused timeline (seconds). */
+  startSeconds: number;
+  lanes: LiveFrame;
+}
+
+/** A transcribed word placed on the session timeline, tagged with its lane. */
+export interface LaneWord extends TimedWord {
+  lane: LiveLane;
+}
+
+/** Display label for a lane's turns in the note; the mixed lane has none. */
+export function laneLabel(lane: LiveLane): string {
+  if (lane === "me") return "Me";
+  if (lane === "others") return "Others";
+  return "";
+}
+
+export function lanesForSource(source: LiveAudioSource): LiveLane[] {
+  return source === "both" ? ["me", "others"] : ["mixed"];
+}
+
+/** The lane fed by the loopback (system audio) device, if the source has one. */
+export function loopbackLane(source: LiveAudioSource): LiveLane | null {
+  if (source === "both") return "others";
+  if (source === "system") return "mixed";
+  return null;
+}
+
+/**
+ * Constraints that switch the browser's voice processing off for a loopback
+ * device: system audio is already clean, and echo cancellation, noise
+ * suppression and gain control only distort it.
+ */
+export const LOOPBACK_AUDIO_PROCESSING = {
+  echoCancellation: false,
+  noiseSuppression: false,
+  autoGainControl: false,
+} as const;
+
+/**
+ * Whether a chunk holds no signal at all. A loopback device that nothing is
+ * routed into delivers exact zeros, unlike a microphone with its noise
+ * floor, so this is only meaningful for the loopback lane. Pure so it can be
+ * tested.
+ */
+export function isSilent(pcm: Float32Array, threshold = 1e-4): boolean {
+  for (let i = 0; i < pcm.length; i++) {
+    if (Math.abs(pcm[i]) >= threshold) return false;
+  }
+  return true;
+}
+
+/**
+ * Where a session writes its audio while it runs (a WAV in a temp folder),
+ * declared structurally so the session and panel import nothing from
+ * `node:fs` and tests inject a fake.
+ */
+export interface LiveAudioSink {
+  readonly path: string;
+  /** Set once the underlying stream failed; later writes are no-ops. */
+  readonly failed: Error | null;
+  /** One buffer per lane, in the session's lane order. */
+  write(lanes: Float32Array[]): void;
+  close(): Promise<unknown>;
+  /** Discard the file (safe after a failure or when nothing was said). */
+  abort(): Promise<void>;
+}
+
+/** What the speaker pass needs from a stopped live session. */
+export interface LiveSpeakerSource {
+  words: LaneWord[];
+  /** Absolute path of the WAV holding the session's audio, one channel per lane. */
+  audioPath: string;
+  lanes: LiveLane[];
+}
+
+/**
+ * Words spread evenly over `seconds` for a chunk whose recognizer reported
+ * no timestamps: alignment degrades to "somewhere in this chunk" instead
+ * of failing. Pure so it can be tested.
+ */
+export function spreadWords(text: string, seconds: number): TimedWord[] {
+  const tokens = text.match(/\S+/g) ?? [];
+  const span = Math.max(0, seconds) / Math.max(1, tokens.length);
+  return tokens.map((token, i) => ({
+    text: token,
+    start: i * span,
+    end: (i + 1) * span,
+  }));
+}
 
 /** Sample rate the Parakeet model expects; capture is done at this rate. */
 export const LIVE_SAMPLE_RATE = 16000;
@@ -214,11 +321,30 @@ export class TranscriptOverlapDeduper {
 
   /** Return `text` without a prefix already emitted by the previous chunk. */
   append(text: string): string {
-    this.correction = null;
     const matches = Array.from(text.matchAll(/\S+/g));
+    const overlap = this.consume(matches.map((match) => match[0]));
     if (matches.length === 0) return "";
+    if (overlap === 0) return text;
+    if (overlap === matches.length) return "";
+    const firstRemaining = matches[overlap];
+    return text.slice(firstRemaining.index ?? 0).trimStart();
+  }
 
-    const words = matches.map((match) => toTranscriptWord(match[0]));
+  /**
+   * The word-object form of `append`: the words not already emitted by the
+   * previous chunk, with whatever else they carry (timestamps, a lane) kept.
+   */
+  appendWords<T extends { text: string }>(words: T[]): T[] {
+    const overlap = this.consume(words.map((word) => word.text));
+    return words.slice(overlap);
+  }
+
+  /** Match `tokens` against the tail, record any correction, return the overlap. */
+  private consume(tokens: string[]): number {
+    this.correction = null;
+    if (tokens.length === 0) return 0;
+
+    const words = tokens.map((token) => toTranscriptWord(token));
     const maxOverlap = Math.min(this.prevWords.length, words.length);
     let overlap = 0;
 
@@ -268,11 +394,7 @@ export class TranscriptOverlapDeduper {
     this.prevWords = this.prevWords
       .concat(emittedWords)
       .slice(-TRANSCRIPT_TAIL_WORDS);
-
-    if (overlap === 0) return text;
-    if (overlap === matches.length) return "";
-    const firstRemaining = matches[overlap];
-    return text.slice(firstRemaining.index ?? 0).trimStart();
+    return overlap;
   }
 
   /** Return a fuller replacement for a clipped word matched by the last append. */
@@ -307,6 +429,11 @@ export class LiveChunker {
     // Clamp so the chunk window always advances.
     this.overlapSamples = Math.min(Math.max(0, overlap), this.chunkSamples - 1);
     this.minFlushSamples = Math.max(1, opts.sampleRate); // 1 second
+  }
+
+  /** Samples between the starts of two consecutive chunks. */
+  get stepSamples(): number {
+    return this.chunkSamples - this.overlapSamples;
   }
 
   /**
@@ -373,6 +500,12 @@ export const CAPTURE_FRAME_SAMPLES = 4096;
  * 16 kHz) still in the worklet when the session stops is dropped, as with
  * the previous ScriptProcessorNode buffer.
  *
+ * The node may have one or two inputs. With one, each message is a bare
+ * `Float32Array`. With two (microphone and loopback), both are cut from
+ * the same render quanta and posted together as `{ lanes: [a, b] }`, so
+ * the lanes are sample-aligned by construction; an input with nothing
+ * connected contributes silence.
+ *
  * It is a string because Obsidian plugins ship as a single bundled file with
  * nothing to serve a worklet script from; the panel loads it via a blob: URL.
  * Only ES2018 syntax is used so the worklet scope needs no transpiling.
@@ -383,22 +516,40 @@ const FRAME_SAMPLES = ${CAPTURE_FRAME_SAMPLES};
 class CaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.frame = new Float32Array(FRAME_SAMPLES);
+    this.frames = null;
     this.filled = 0;
   }
 
   process(inputs) {
-    const channel = inputs[0] && inputs[0][0];
-    if (!channel) return true;
+    if (inputs.length === 0) return true;
+    if (!this.frames || this.frames.length !== inputs.length) {
+      this.frames = inputs.map(() => new Float32Array(FRAME_SAMPLES));
+      this.filled = 0;
+    }
+    let length = 0;
+    for (const input of inputs) {
+      if (input && input[0]) { length = input[0].length; break; }
+    }
+    if (length === 0) return true;
     let offset = 0;
-    while (offset < channel.length) {
-      const n = Math.min(channel.length - offset, FRAME_SAMPLES - this.filled);
-      this.frame.set(channel.subarray(offset, offset + n), this.filled);
+    while (offset < length) {
+      const n = Math.min(length - offset, FRAME_SAMPLES - this.filled);
+      for (let i = 0; i < inputs.length; i++) {
+        const channel = inputs[i] && inputs[i][0];
+        if (channel) {
+          this.frames[i].set(channel.subarray(offset, offset + n), this.filled);
+        }
+      }
       this.filled += n;
       offset += n;
       if (this.filled === FRAME_SAMPLES) {
-        this.port.postMessage(this.frame, [this.frame.buffer]);
-        this.frame = new Float32Array(FRAME_SAMPLES);
+        const frames = this.frames;
+        if (frames.length === 1) {
+          this.port.postMessage(frames[0], [frames[0].buffer]);
+        } else {
+          this.port.postMessage({ lanes: frames }, frames.map((f) => f.buffer));
+        }
+        this.frames = inputs.map(() => new Float32Array(FRAME_SAMPLES));
         this.filled = 0;
       }
     }
@@ -429,7 +580,7 @@ export interface LiveMediaStreamLike {
 }
 
 export interface LiveAudioNodeLike {
-  connect(destination: unknown): void;
+  connect(destination: unknown, output?: number, input?: number): void;
   disconnect(): void;
 }
 
@@ -457,10 +608,14 @@ export interface LiveCaptureDeps {
   createAudioContext(sampleRate: number): LiveAudioContextLike;
   /**
    * Install the capture worklet (`CAPTURE_WORKLET_SOURCE`, registered as
-   * `CAPTURE_PROCESSOR_NAME`) in `context` and return a node for it. The
-   * node's port posts one `Float32Array` of mono samples per captured frame.
+   * `CAPTURE_PROCESSOR_NAME`) in `context` with `numberOfInputs` inputs and
+   * return a node for it. The node's port posts one message per captured
+   * frame: a `Float32Array` for one input, `{ lanes: Float32Array[] }` for two.
    */
-  createCaptureNode(context: LiveAudioContextLike): Promise<LiveCaptureNodeLike>;
+  createCaptureNode(
+    context: LiveAudioContextLike,
+    numberOfInputs: number,
+  ): Promise<LiveCaptureNodeLike>;
 }
 
 export interface LiveRecordingSessionOptions {
@@ -469,8 +624,17 @@ export interface LiveRecordingSessionOptions {
   /** Seconds of overlap between chunks (default 0.5). */
   overlapSeconds?: number;
   sampleRate?: number;
-  /** Called with each full chunk of 16 kHz mono PCM, in arrival order. */
-  onChunk: (pcm: Float32Array) => void;
+  /**
+   * Called with each full window of 16 kHz mono PCM in arrival order: one
+   * chunk per lane, all cut from the same samples.
+   */
+  onWindow: (window: LiveWindow) => void;
+  /**
+   * Called with every captured frame before it is chunked; frames dropped
+   * while paused never reach it, so audio written from here has exactly the
+   * windows' timeline.
+   */
+  onFrame?: (frame: LiveFrame) => void;
   /** Called for unexpected in-session errors (e.g. the track ended). */
   onError: (error: Error) => void;
   /** Injectable clock (ms) for testability; defaults to Date.now. */
@@ -478,25 +642,28 @@ export interface LiveRecordingSessionOptions {
 }
 
 /**
- * One live recording session: owns the MediaStream, the 16 kHz AudioContext
- * graph, and the chunker. `pause()` suspends capture (frames are dropped and
- * the tracks are disabled) without ending the session; `stop()` tears the
- * graph down and returns the final partial chunk if it is at least one
- * second long.
+ * One live recording session: owns the MediaStreams, the 16 kHz AudioContext
+ * graph, and one chunker per lane. `pause()` suspends capture (frames are
+ * dropped and the tracks are disabled) without ending the session; `stop()`
+ * tears the graph down and returns the final partial window if it holds at
+ * least one second of audio.
  */
 export class LiveRecordingSession {
   private readonly deps: LiveCaptureDeps;
   private readonly chunkSeconds: number;
   private readonly overlapSeconds: number;
   private readonly sampleRate: number;
-  private readonly onChunk: (pcm: Float32Array) => void;
+  private readonly onWindow: (window: LiveWindow) => void;
+  private readonly onFrame: ((frame: LiveFrame) => void) | undefined;
   private readonly onError: (error: Error) => void;
   private readonly clock: () => number;
 
-  private chunker: LiveChunker;
-  private stream: LiveMediaStreamLike | null = null;
+  private lanes: LiveLane[] = ["mixed"];
+  private chunkers = new Map<LiveLane, LiveChunker>();
+  private windowIndex = 0;
+  private streams: LiveMediaStreamLike[] = [];
   private context: LiveAudioContextLike | null = null;
-  private sourceNode: LiveAudioNodeLike | null = null;
+  private sourceNodes: LiveAudioNodeLike[] = [];
   private captureNode: LiveCaptureNodeLike | null = null;
   private starting = false;
   private recording = false;
@@ -510,14 +677,26 @@ export class LiveRecordingSession {
     this.chunkSeconds = opts.chunkSeconds ?? 15;
     this.overlapSeconds = opts.overlapSeconds ?? 0.5;
     this.sampleRate = opts.sampleRate ?? LIVE_SAMPLE_RATE;
-    this.onChunk = opts.onChunk;
+    this.onWindow = opts.onWindow;
+    this.onFrame = opts.onFrame;
     this.onError = opts.onError;
     this.clock = opts.clock ?? (() => Date.now());
-    this.chunker = new LiveChunker({
-      sampleRate: this.sampleRate,
-      chunkSeconds: this.chunkSeconds,
-      overlapSeconds: this.overlapSeconds,
-    });
+    this.resetChunkers(["mixed"]);
+  }
+
+  private resetChunkers(lanes: LiveLane[]): void {
+    this.lanes = lanes;
+    this.chunkers = new Map(
+      lanes.map((lane) => [
+        lane,
+        new LiveChunker({
+          sampleRate: this.sampleRate,
+          chunkSeconds: this.chunkSeconds,
+          overlapSeconds: this.overlapSeconds,
+        }),
+      ]),
+    );
+    this.windowIndex = 0;
   }
 
   isRecording(): boolean {
@@ -528,8 +707,13 @@ export class LiveRecordingSession {
     return this.paused;
   }
 
+  /** The lanes this session captures: `["mixed"]`, or `["me", "others"]`. */
+  getLanes(): LiveLane[] {
+    return [...this.lanes];
+  }
+
   /**
-   * Acquire the audio stream and start the capture graph.
+   * Acquire the audio stream(s) and start the capture graph.
    *
    * - `"microphone"`: `getUserMedia` (optionally pinned to `deviceId`).
    * - `"system"`: if a specific input device is selected (a loopback device
@@ -538,8 +722,15 @@ export class LiveRecordingSession {
    *   and use its audio track when the platform provides one; when it does
    *   not, throw a descriptive error so the caller can direct the user to a
    *   loopback device. The microphone is never used as a silent fallback.
+   * - `"both"`: the microphone (`micDeviceId`) as the `me` lane and the
+   *   system source (`deviceId`, as above) as the `others` lane, through one
+   *   two-input worklet so the lanes stay sample-aligned.
    */
-  async start(source: LiveAudioSource, deviceId?: string): Promise<void> {
+  async start(
+    source: LiveAudioSource,
+    deviceId?: string,
+    micDeviceId?: string,
+  ): Promise<void> {
     if (this.recording || this.starting) {
       throw new Error("A live recording session is already active.");
     }
@@ -547,24 +738,24 @@ export class LiveRecordingSession {
     // the stream and the capture graph are still being set up.
     this.starting = true;
     try {
-      await this.startCapture(source, deviceId);
+      await this.startCapture(source, deviceId, micDeviceId);
     } finally {
       this.starting = false;
     }
   }
 
-  private async startCapture(
-    source: LiveAudioSource,
+  private async acquireStream(
+    source: "microphone" | "system",
     deviceId?: string,
-  ): Promise<void> {
-    let stream: LiveMediaStreamLike;
+  ): Promise<LiveMediaStreamLike> {
     if (source === "system" && deviceId) {
       // A loopback input device is an ordinary audioinput on the OS.
-      stream = await this.deps.getUserMedia({
-        audio: { deviceId: { exact: deviceId } },
+      return this.deps.getUserMedia({
+        audio: { deviceId: { exact: deviceId }, ...LOOPBACK_AUDIO_PROCESSING },
         video: false,
       });
-    } else if (source === "system") {
+    }
+    if (source === "system") {
       let displayStream: LiveMediaStreamLike | null = null;
       try {
         displayStream = await this.deps.getDisplayMedia({
@@ -589,34 +780,58 @@ export class LiveRecordingSession {
       }
       // Keep only the audio track; we do not use the shared video.
       for (const track of displayStream.getVideoTracks()) track.stop();
-      stream = displayStream;
-    } else {
-      stream = await this.deps.getUserMedia({
-        audio: deviceId ? { deviceId: { exact: deviceId } } : true,
-        video: false,
-      });
+      return displayStream;
+    }
+    return this.deps.getUserMedia({
+      audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+      video: false,
+    });
+  }
+
+  private async startCapture(
+    source: LiveAudioSource,
+    deviceId?: string,
+    micDeviceId?: string,
+  ): Promise<void> {
+    const lanes = lanesForSource(source);
+    const streams: LiveMediaStreamLike[] = [];
+    const stopStreams = () => {
+      for (const stream of streams) {
+        for (const track of stream.getTracks()) track.stop();
+      }
+    };
+    try {
+      if (source === "both") {
+        streams.push(await this.acquireStream("microphone", micDeviceId));
+        streams.push(await this.acquireStream("system", deviceId));
+      } else {
+        streams.push(await this.acquireStream(source, deviceId));
+      }
+    } catch (e) {
+      // The microphone may already be live when the loopback fails.
+      stopStreams();
+      throw e;
     }
 
-    // The stream is live from here on. If the session cannot start, release
-    // it (so the OS recording indicator goes off) and whatever part of the
-    // graph exists, then fail with `reason`.
+    // The streams are live from here on. If the session cannot start,
+    // release them (so the OS recording indicator goes off) and whatever
+    // part of the graph exists, then fail with `reason`.
     let context: LiveAudioContextLike | null = null;
     const abort = async (reason: Error): Promise<never> => {
-      for (const track of stream.getTracks()) track.stop();
+      stopStreams();
       await context?.close().catch(() => undefined);
       throw reason;
     };
 
-    let sourceNode: LiveAudioNodeLike;
+    let sourceNodes: LiveAudioNodeLike[] = [];
     let captureNode: LiveCaptureNodeLike;
     try {
       context = this.deps.createAudioContext(this.sampleRate);
-      captureNode = await this.deps.createCaptureNode(context);
-      captureNode.port.onmessage = (event) => {
-        if (event.data instanceof Float32Array) this.handleFrame(event.data);
-      };
-      sourceNode = context.createMediaStreamSource(stream);
-      sourceNode.connect(captureNode);
+      captureNode = await this.deps.createCaptureNode(context, lanes.length);
+      captureNode.port.onmessage = (event) => this.handleMessage(event.data);
+      const ctx = context;
+      sourceNodes = streams.map((stream) => ctx.createMediaStreamSource(stream));
+      sourceNodes.forEach((node, input) => node.connect(captureNode, 0, input));
       // Chromium only renders a worklet node that reaches the destination;
       // the processor writes no output, so nothing is audible.
       captureNode.connect(context.destination);
@@ -626,27 +841,28 @@ export class LiveRecordingSession {
 
     // Installing the worklet is asynchronous; a track that ended meanwhile
     // fired its one-shot `ended` event before any handler was attached.
-    if (stream.getAudioTracks().some((track) => track.readyState === "ended")) {
+    const ended = streams.some((stream) =>
+      stream.getAudioTracks().some((track) => track.readyState === "ended"),
+    );
+    if (ended) {
       return abort(new Error("The audio input ended before recording started."));
     }
 
-    // If the OS revokes the stream mid-session (e.g. device unplugged),
+    // If the OS revokes a stream mid-session (e.g. device unplugged),
     // surface it and tear down.
-    for (const track of stream.getTracks()) {
-      track.onended = () => {
-        if (!this.recording) return;
-        this.onError(new Error("The audio input ended unexpectedly."));
-      };
+    for (const stream of streams) {
+      for (const track of stream.getTracks()) {
+        track.onended = () => {
+          if (!this.recording) return;
+          this.onError(new Error("The audio input ended unexpectedly."));
+        };
+      }
     }
 
-    this.chunker = new LiveChunker({
-      sampleRate: this.sampleRate,
-      chunkSeconds: this.chunkSeconds,
-      overlapSeconds: this.overlapSeconds,
-    });
-    this.stream = stream;
+    this.resetChunkers(lanes);
+    this.streams = streams;
     this.context = context;
-    this.sourceNode = sourceNode;
+    this.sourceNodes = sourceNodes;
     this.captureNode = captureNode;
     this.recording = true;
     this.paused = false;
@@ -658,14 +874,14 @@ export class LiveRecordingSession {
   /**
    * Suspend capture: incoming frames are dropped and the tracks are
    * disabled (so the OS recording indicator reflects the pause). Samples
-   * already buffered in the chunker are kept; chunking continues on resume.
+   * already buffered in the chunkers are kept; chunking continues on resume.
    */
   pause(): void {
     if (!this.recording || this.paused) return;
     this.paused = true;
     this.pausedAtMs = this.clock();
-    for (const track of this.stream?.getTracks() ?? []) {
-      track.enabled = false;
+    for (const stream of this.streams) {
+      for (const track of stream.getTracks()) track.enabled = false;
     }
   }
 
@@ -674,17 +890,17 @@ export class LiveRecordingSession {
     if (!this.recording || !this.paused) return;
     this.pausedTotalMs += this.clock() - this.pausedAtMs;
     this.paused = false;
-    for (const track of this.stream?.getTracks() ?? []) {
-      track.enabled = true;
+    for (const stream of this.streams) {
+      for (const track of stream.getTracks()) track.enabled = true;
     }
   }
 
   /**
    * End the session: tear down the graph, stop the tracks, close the
-   * context, and return the final partial chunk (when it is at least one
-   * second of audio) so the caller can transcribe it.
+   * context, and return the final partial window (when it holds at least
+   * one second of audio) so the caller can transcribe it.
    */
-  async stop(): Promise<Float32Array | null> {
+  async stop(): Promise<LiveWindow | null> {
     if (!this.recording) return null;
     this.recording = false;
     if (this.paused) {
@@ -692,11 +908,11 @@ export class LiveRecordingSession {
       this.paused = false;
     }
 
-    const tail = this.chunker.flush();
+    const tail = this.flushWindow();
 
     const captureNode = this.captureNode;
     this.captureNode = null;
-    this.sourceNode = null;
+    this.sourceNodes = [];
     if (captureNode) {
       captureNode.port.onmessage = null;
       captureNode.port.close();
@@ -706,11 +922,13 @@ export class LiveRecordingSession {
         // already disconnected
       }
     }
-    const stream = this.stream;
-    this.stream = null;
-    for (const track of stream?.getTracks() ?? []) {
-      track.onended = null;
-      track.stop();
+    const streams = this.streams;
+    this.streams = [];
+    for (const stream of streams) {
+      for (const track of stream.getTracks()) {
+        track.onended = null;
+        track.stop();
+      }
     }
     const context = this.context;
     this.context = null;
@@ -731,10 +949,71 @@ export class LiveRecordingSession {
     return Math.max(0, (now - this.startedAtMs - this.pausedTotalMs) / 1000);
   }
 
-  private handleFrame(samples: Float32Array): void {
+  private makeWindow(lanes: LiveFrame): LiveWindow {
+    const index = this.windowIndex++;
+    const step = this.chunkers.get(this.lanes[0])?.stepSamples ?? 0;
+    return { index, startSeconds: (index * step) / this.sampleRate, lanes };
+  }
+
+  /** The lanes' remaining samples as one last window, or null when too short. */
+  private flushWindow(): LiveWindow | null {
+    const lanes: LiveFrame = {};
+    let any = false;
+    for (const lane of this.lanes) {
+      const out = this.chunkers.get(lane)?.flush() ?? null;
+      if (out) {
+        lanes[lane] = out;
+        any = true;
+      }
+    }
+    return any ? this.makeWindow(lanes) : null;
+  }
+
+  /**
+   * The lanes carried by one port message: a bare `Float32Array` for a
+   * single-lane session, `{ lanes: [me, others] }` for a two-lane one.
+   * Anything else (a message posted before the graph settled, say) is
+   * ignored.
+   */
+  private frameFromMessage(data: unknown): LiveFrame | null {
+    if (this.lanes.length === 1) {
+      return data instanceof Float32Array ? { [this.lanes[0]]: data } : null;
+    }
+    const lanes =
+      typeof data === "object" && data !== null
+        ? (data as { lanes?: unknown }).lanes
+        : undefined;
+    if (
+      !Array.isArray(lanes) ||
+      lanes.length !== this.lanes.length ||
+      !lanes.every((lane) => lane instanceof Float32Array)
+    ) {
+      return null;
+    }
+    const frame: LiveFrame = {};
+    this.lanes.forEach((lane, i) => {
+      frame[lane] = lanes[i] as Float32Array;
+    });
+    return frame;
+  }
+
+  private handleMessage(data: unknown): void {
     if (!this.recording || this.paused) return;
-    for (const chunk of this.chunker.push(samples)) {
-      this.onChunk(chunk);
+    const frame = this.frameFromMessage(data);
+    if (!frame) return;
+    this.onFrame?.(frame);
+    // Every lane receives the same number of samples, so the chunkers emit
+    // the same number of chunks and chunk k of each lane forms window k.
+    const perLane = this.lanes.map(
+      (lane) => this.chunkers.get(lane)?.push(frame[lane] ?? new Float32Array(0)) ?? [],
+    );
+    const count = Math.min(...perLane.map((chunks) => chunks.length));
+    for (let i = 0; i < count; i++) {
+      const lanes: LiveFrame = {};
+      this.lanes.forEach((lane, l) => {
+        lanes[lane] = perLane[l][i];
+      });
+      this.onWindow(this.makeWindow(lanes));
     }
   }
 }

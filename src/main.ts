@@ -6,29 +6,43 @@ import {
   TFile,
   TFolder,
 } from "obsidian";
+import * as os from "node:os";
 import * as path from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, promises as fsp } from "node:fs";
 
 import {
   DEFAULT_SETTINGS,
   TranscriberSettingTab,
   type TranscriberSettings,
 } from "./settings";
-import { decodeToMono16k, isAudioFile } from "./audio";
+import { decodeToMono16k, downmixToMono, isAudioFile } from "./audio";
 import {
   missingModelFiles,
   missingModelFilesMessage,
   releaseRecognizer,
   transcribe,
+  transcribeLongWithTimestamps,
+  transcribeWithTimestamps,
+  type StructuredTranscript,
 } from "./transcriber";
-import { downloadModel } from "./model-download";
+import {
+  diarize,
+  missingDiarizationModelFiles,
+  missingDiarizationModelFilesMessage,
+  releaseDiarizer,
+  type DiarizationOptions,
+} from "./diarize";
+import { mixedSpeakerTranscript, speakerTranscript } from "./speakers";
+import { decodeWavPcm16, WavFileWriter } from "./wav";
+import { downloadDiarizationModels, downloadModel } from "./model-download";
 import { summarizeTranscript } from "./summarize";
-import { normalizeTranscript } from "./normalize";
+import { normalizeSpeakerTranscript } from "./normalize";
 import {
   applySummaryToBody,
   extractTranscriptSection,
   formatLocalDate,
   formatLocalTime,
+  linkTargetFromFrontmatterValue,
   mergeSummaryIntoFrontmatter,
   NO_SPEECH_MARKER,
   noteFileName,
@@ -39,7 +53,12 @@ import {
   LiveRecordingPanel,
   LIVE_PANEL_VIEW_TYPE,
 } from "./live-panel";
-import { LiveSessionRegistry } from "./live";
+import {
+  laneLabel,
+  LiveSessionRegistry,
+  type LiveAudioSink,
+  type LiveSpeakerSource,
+} from "./live";
 import { StatusBoard } from "./status";
 
 /**
@@ -60,10 +79,27 @@ import { StatusBoard } from "./status";
  *   text in `## Transcript` is replaced with clean written English, either
  *   automatically (new file transcriptions, live sessions when they stop) or
  *   through the "Normalize transcript with S1-mini" command.
+ * - Optionally labels who is speaking with a local diarization model
+ *   (pyannote segmentation + TitaNet embeddings via sherpa-onnx): the
+ *   transcript becomes `**Speaker N:**` turns aligned on Parakeet's word
+ *   timestamps, after a file is transcribed, when a live session stops, or
+ *   through the "Assign speakers to transcript" command.
  *
  * Desktop only: the ASR engine is a native Node addon and audio decoding uses
  * the Web Audio API.
  */
+/** Folder for the temporary WAV a live session keeps until its speaker pass ran. */
+export function liveAudioTempDir(): string {
+  return path.join(os.tmpdir(), "obsidian-meeting-transcriber");
+}
+
+/** Suffix for a "done" Notice describing what the speaker pass found. */
+function speakerSummary(speakers: number | null): string {
+  if (speakers === null) return "";
+  if (speakers <= 1) return " (one speaker, no labels added)";
+  return ` (${speakers} speakers)`;
+}
+
 export default class MeetingTranscriberPlugin extends Plugin {
   settings: TranscriberSettings = DEFAULT_SETTINGS;
   /**
@@ -79,6 +115,8 @@ export default class MeetingTranscriberPlugin extends Plugin {
   private downloadingModel = false;
   /** Paths of notes being normalized, so one is never rewritten twice at once. */
   private normalizing = new Set<string>();
+  /** Paths of notes having speakers assigned, for the same reason. */
+  private diarizing = new Set<string>();
   /** Plugin-wide coordination: at most one live recording session at a time. */
   private liveSessions = new LiveSessionRegistry();
   /** Set at the start of onunload; pending live chunks are then skipped. */
@@ -127,6 +165,22 @@ export default class MeetingTranscriberPlugin extends Plugin {
       name: "Normalize transcript with S1-mini",
       callback: () => {
         void this.normalizeActiveOrSuggested();
+      },
+    });
+
+    this.addCommand({
+      id: "download-diarization-models",
+      name: "Download diarization models",
+      callback: () => {
+        void this.downloadDiarizationModelFiles();
+      },
+    });
+
+    this.addCommand({
+      id: "assign-speakers",
+      name: "Assign speakers to transcript",
+      callback: () => {
+        void this.assignSpeakersActiveOrSuggested();
       },
     });
 
@@ -181,6 +235,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     // Drop the cached Parakeet recognizer so its native memory can be
     // reclaimed once the plugin's references are gone.
     releaseRecognizer();
+    releaseDiarizer();
     // Obsidian removes registered commands and the status bar item for us.
   }
 
@@ -257,13 +312,19 @@ export default class MeetingTranscriberPlugin extends Plugin {
     const progress = new Notice("Transcribing… this can take a few minutes.");
     let note: TFile | null = null;
     try {
-      const text = await transcribe(samples, modelDirAbs, pluginDir);
+      const { text, speakers } = await this.transcribeAndLabel(
+        samples,
+        modelDirAbs,
+        pluginDir,
+        status,
+        progress,
+      );
       if (!text) {
         new Notice("Transcription produced no text.", 10000);
         return;
       }
       note = await this.createTranscriptionNote(file, text);
-      new Notice(`Transcribed ${file.name}.`, 8000);
+      new Notice(`Transcribed ${file.name}${speakerSummary(speakers)}.`, 8000);
     } catch (e) {
       new Notice(
         `Transcription failed: ${(e as Error).message}`,
@@ -312,6 +373,30 @@ export default class MeetingTranscriberPlugin extends Plugin {
     const modelDirAbs = this.resolveModelDir();
     if (!modelDirAbs) return ["<non-desktop adapter>"];
     return missingModelFiles(modelDirAbs, existsSync);
+  }
+
+  /** Absolute path of the diarization model directory (see `resolveModelDir`). */
+  resolveDiarizationModelDir(): string | null {
+    const adapter = this.app.vault.adapter;
+    if (!(adapter instanceof FileSystemAdapter)) return null;
+    const dir = path.join(
+      adapter.getBasePath(),
+      this.settings.diarizationModelDir,
+    );
+    return dir.split(path.sep).join("/");
+  }
+
+  findMissingDiarizationModelFiles(): string[] {
+    const dir = this.resolveDiarizationModelDir();
+    if (!dir) return ["<non-desktop adapter>"];
+    return missingDiarizationModelFiles(dir, existsSync);
+  }
+
+  private diarizationOptions(): DiarizationOptions {
+    return {
+      numSpeakers: this.settings.diarizationNumSpeakers,
+      threshold: this.settings.diarizationThreshold,
+    };
   }
 
   private async createTranscriptionNote(
@@ -413,6 +498,483 @@ export default class MeetingTranscriberPlugin extends Plugin {
     } finally {
       this.downloadingModel = false;
       this.setStatus(status, "");
+    }
+  }
+
+  private async downloadDiarizationModelFiles(): Promise<void> {
+    if (this.downloadingModel) {
+      new Notice("A model download is already in progress.", 8000);
+      return;
+    }
+    const destDir = this.resolveDiarizationModelDir();
+    if (!destDir) {
+      new Notice(
+        "Model download requires the desktop file-system adapter.",
+        10000,
+      );
+      return;
+    }
+    this.downloadingModel = true;
+    const status = this.newStatusOwner("model-download");
+    const notice = new Notice("Downloading diarization models (~42 MB)…");
+    this.setStatus(status, "Downloading diarization models…");
+    // As for Parakeet: a cached diarizer would keep the old weights.
+    releaseDiarizer();
+    try {
+      await downloadDiarizationModels(destDir, (p) => {
+        const pct =
+          p.total && p.total > 0
+            ? ` (${Math.round((p.received / p.total) * 100)}%)`
+            : "";
+        notice.messageEl.setText(
+          `Downloading ${p.file}${pct} [${p.index + 1}/${p.count}]`,
+        );
+        this.setStatus(status, `Model ${p.index + 1}/${p.count}: ${p.file}`);
+      });
+      new Notice("Diarization models downloaded.", 8000);
+    } catch (e) {
+      new Notice(`Model download failed: ${(e as Error).message}`, 15000);
+    } finally {
+      this.downloadingModel = false;
+      this.setStatus(status, "");
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Speaker pass (diarization)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Transcribe `samples` and, when the speaker pass is enabled and its
+   * models are installed, label who is speaking. The pass never blocks a
+   * transcription: missing models, or a recognizer that reports no
+   * timestamps, fall back to the plain text with a Notice naming the cause.
+   * `speakers` is null when no pass ran.
+   */
+  private async transcribeAndLabel(
+    samples: Float32Array,
+    modelDir: string,
+    pluginDir: string,
+    status: string,
+    notice: Notice,
+  ): Promise<{ text: string; speakers: number | null }> {
+    if (!this.settings.diarizationEnabled) {
+      return { text: await transcribe(samples, modelDir, pluginDir), speakers: null };
+    }
+    const missing = this.findMissingDiarizationModelFiles();
+    if (missing.length > 0) {
+      new Notice(
+        `${missingDiarizationModelFilesMessage(missing)} Transcribing ` +
+          "without speaker labels.",
+        15000,
+      );
+      return { text: await transcribe(samples, modelDir, pluginDir), speakers: null };
+    }
+    const structured = await transcribeWithTimestamps(
+      samples,
+      modelDir,
+      pluginDir,
+    );
+    if (!structured.text) return { text: "", speakers: null };
+    if (structured.words.length === 0) {
+      new Notice(
+        "The recognizer returned no word timestamps; speakers were not assigned.",
+        10000,
+      );
+      return { text: structured.text, speakers: null };
+    }
+    return this.labelSpeakers(samples, structured, pluginDir, status, notice);
+  }
+
+  /** Diarize `samples` and render `structured` as speaker turns. */
+  private async labelSpeakers(
+    samples: Float32Array,
+    structured: StructuredTranscript,
+    pluginDir: string,
+    status: string,
+    notice: Notice,
+  ): Promise<{ text: string; speakers: number }> {
+    const diarizationDir = this.resolveDiarizationModelDir();
+    if (!diarizationDir) {
+      throw new Error(
+        "Speaker assignment requires the desktop file-system adapter.",
+      );
+    }
+    const report = (pct: number | null) => {
+      const suffix = pct === null ? "" : ` ${pct}%`;
+      notice.messageEl.setText(`Assigning speakers…${suffix}`);
+      this.setStatus(status, `Assigning speakers${suffix}`);
+    };
+    report(null);
+    const segments = await diarize(
+      samples,
+      diarizationDir,
+      pluginDir,
+      this.diarizationOptions(),
+      ({ processed, total }) =>
+        report(total > 0 ? Math.round((processed / total) * 100) : null),
+    );
+    const result = speakerTranscript(structured.words, segments);
+    return { text: result.text || structured.text, speakers: result.speakers };
+  }
+
+  private async assignSpeakersActiveOrSuggested(): Promise<void> {
+    const active = this.app.workspace.getActiveFile();
+    if (active && active.extension === "md") {
+      await this.assignSpeakersToNote(active);
+      return;
+    }
+    new NoteSuggestModal(
+      this.app,
+      this.settings.outputFolder,
+      "Pick a transcription note to assign speakers to",
+      (file) => {
+        void this.assignSpeakersToNote(file);
+      },
+    ).open();
+  }
+
+  /** Why the speaker pass cannot run right now, or null when it can. */
+  private diarizationUnavailableReason(): string | null {
+    if (!this.settings.diarizationEnabled) {
+      return "Enable 'Assign speakers to transcripts' in the plugin settings first.";
+    }
+    if (!this.resolveModelDir() || !this.resolvePluginDir()) {
+      return "Speaker assignment requires the desktop file-system adapter.";
+    }
+    const missing = this.findMissingModelFiles();
+    if (missing.length > 0) return missingModelFilesMessage(missing);
+    const missingDiarization = this.findMissingDiarizationModelFiles();
+    if (missingDiarization.length > 0) {
+      return missingDiarizationModelFilesMessage(missingDiarization);
+    }
+    return null;
+  }
+
+  /**
+   * Locate and decode the audio behind a transcription note: `audio:` in
+   * the frontmatter is the absolute path of a kept live recording, `source:`
+   * a `[[link]]` to an audio file in the vault. Returns the channels at
+   * 16 kHz, or null after a Notice when there is nothing to decode.
+   */
+  private async readNoteAudio(file: TFile): Promise<Float32Array[] | null> {
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    const audioPath = linkTargetFromFrontmatterValue(fm?.audio);
+    if (audioPath && path.isAbsolute(audioPath)) {
+      if (!existsSync(audioPath)) {
+        new Notice(`The recording ${audioPath} no longer exists.`, 10000);
+        return null;
+      }
+      const bytes = await fsp.readFile(audioPath);
+      const wav = decodeWavPcm16(
+        bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      );
+      if (!wav || wav.sampleRate !== 16000) {
+        new Notice(`${audioPath} is not a 16 kHz PCM recording.`, 10000);
+        return null;
+      }
+      return wav.channels;
+    }
+
+    const target = linkTargetFromFrontmatterValue(fm?.source);
+    const linked = target
+      ? this.app.metadataCache.getFirstLinkpathDest(target, file.path)
+      : null;
+    if (!linked || !isAudioFile(linked.path)) {
+      new Notice(
+        "This note has no audio to assign speakers from: its frontmatter " +
+          "links no audio file, and a live recording keeps its audio only " +
+          "until the speaker pass has run.",
+        15000,
+      );
+      return null;
+    }
+    const arrayBuffer = await this.app.vault.adapter.readBinary(linked.path);
+    const wav = decodeWavPcm16(arrayBuffer);
+    if (wav && wav.sampleRate === 16000) return wav.channels;
+    const audioCtx = new AudioContext();
+    try {
+      return [
+        await decodeToMono16k(
+          arrayBuffer,
+          () => audioCtx,
+          (length, rate) => new OfflineAudioContext(1, length, rate),
+        ),
+      ];
+    } finally {
+      void audioCtx.close();
+    }
+  }
+
+  /**
+   * Delete the temporary recording a note's `audio:` frontmatter points at
+   * and drop the field. Only files inside the plugin's own temp folder are
+   * ever removed; anything else named in a note is left alone.
+   */
+  async discardKeptAudio(file: TFile): Promise<void> {
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    const audioPath = linkTargetFromFrontmatterValue(fm?.audio);
+    if (!audioPath || !path.isAbsolute(audioPath)) return;
+    const tempDir = liveAudioTempDir();
+    if (path.dirname(audioPath) === tempDir) {
+      await fsp.rm(audioPath, { force: true }).catch(() => undefined);
+    }
+    await this.app.fileManager
+      .processFrontMatter(file, (data) => {
+        delete data.audio;
+      })
+      .catch(() => undefined);
+  }
+
+  /**
+   * Create the temporary WAV a live session records into, outside the vault
+   * (a vault may be synced) and deleted once the speaker pass has run.
+   */
+  async openLiveAudioSink(
+    note: TFile,
+    channels: number,
+  ): Promise<LiveAudioSink | null> {
+    const file = path.join(liveAudioTempDir(), `${note.basename}.wav`);
+    try {
+      return await WavFileWriter.open(file, 16000, channels);
+    } catch (e) {
+      new Notice(
+        `Could not create the recording's audio file (${(e as Error).message}); ` +
+          "speakers will not be assigned.",
+        10000,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * The speaker pass for a live session that just stopped: diarize the
+   * kept audio (the `others` channel when the microphone was captured
+   * separately, so "Me" stays fixed) and relabel the words the session
+   * already transcribed, then delete the audio. On any failure the audio
+   * is kept and its path written to the note's `audio:` frontmatter so the
+   * "Assign speakers to transcript" command can retry. Never rejects.
+   */
+  async assignSpeakersToLiveNote(
+    note: TFile,
+    source: LiveSpeakerSource,
+  ): Promise<void> {
+    const keepForRetry = async (why: string): Promise<void> => {
+      await this.app.fileManager
+        .processFrontMatter(note, (data) => {
+          data.audio = source.audioPath;
+        })
+        .catch(() => undefined);
+      new Notice(
+        `${why} The recording's audio was kept; run "Assign speakers to ` +
+          `transcript" on ${note.name} to retry.`,
+        15000,
+      );
+    };
+    const reason = this.diarizationUnavailableReason();
+    if (reason) {
+      await keepForRetry(reason);
+      return;
+    }
+    const pluginDir = this.resolvePluginDir();
+    const diarizationDir = this.resolveDiarizationModelDir();
+    if (!pluginDir || !diarizationDir) return;
+    if (this.diarizing.has(note.path)) {
+      await keepForRetry(`Already assigning speakers to ${note.name}.`);
+      return;
+    }
+
+    this.diarizing.add(note.path);
+    const status = this.newStatusOwner("speakers");
+    const notice = new Notice("Assigning speakers…", 0);
+    this.setStatus(status, "Assigning speakers…");
+    let done = false;
+    try {
+      const content = await this.app.vault.read(note);
+      const raw = extractTranscriptSection(content);
+      if (raw === null) {
+        new Notice(`No "## Transcript" section in ${note.name}.`, 10000);
+        done = true;
+        return;
+      }
+      const bytes = await fsp.readFile(source.audioPath);
+      const wav = decodeWavPcm16(
+        bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      );
+      if (
+        !wav ||
+        wav.sampleRate !== 16000 ||
+        wav.channels.length < source.lanes.length
+      ) {
+        throw new Error("the kept audio could not be read");
+      }
+      const diarizeLane = source.lanes.includes("others")
+        ? "others"
+        : source.lanes[0];
+      const pcm = wav.channels[source.lanes.indexOf(diarizeLane)];
+      const report = (pct: number | null) => {
+        const suffix = pct === null ? "" : ` ${pct}%`;
+        notice.messageEl.setText(`Assigning speakers…${suffix}`);
+        this.setStatus(status, `Assigning speakers${suffix}`);
+      };
+      const segments = await diarize(
+        pcm,
+        diarizationDir,
+        pluginDir,
+        this.diarizationOptions(),
+        ({ processed, total }) =>
+          report(total > 0 ? Math.round((processed / total) * 100) : null),
+      );
+      const words = source.words.slice().sort((a, b) => a.start - b.start);
+      const fixed = words.map((word) =>
+        word.lane === diarizeLane ? null : laneLabel(word.lane),
+      );
+      const result = mixedSpeakerTranscript(
+        words,
+        fixed,
+        segments,
+        laneLabel(diarizeLane),
+      );
+      if (!result.text) {
+        new Notice(`Nothing to label in ${note.name}.`, 8000);
+        done = true;
+        return;
+      }
+      let applied = false;
+      await this.app.vault.process(note, (current) => {
+        if (extractTranscriptSection(current) !== raw) return current;
+        applied = true;
+        return replaceTranscriptSection(current, result.text);
+      });
+      if (!applied) {
+        await keepForRetry(
+          `The transcript in ${note.name} changed while speakers were ` +
+            "being assigned; nothing was applied.",
+        );
+        return;
+      }
+      done = true;
+      new Notice(
+        `Assigned speakers in ${note.name}${speakerSummary(result.speakers)}.`,
+        8000,
+      );
+    } catch (e) {
+      await keepForRetry(`Speaker assignment failed: ${(e as Error).message}.`);
+    } finally {
+      if (done) {
+        await fsp.rm(source.audioPath, { force: true }).catch(() => undefined);
+      }
+      notice.hide();
+      this.setStatus(status, "");
+      this.diarizing.delete(note.path);
+    }
+  }
+
+  /**
+   * Rewrite the `## Transcript` section of `file` with speaker turns from a
+   * fresh timestamped transcription of the note's audio. Mirrors
+   * `normalizeNoteTranscript`: never rejects, reports through Notices, and
+   * leaves the note untouched when its transcript changed meanwhile.
+   */
+  async assignSpeakersToNote(file: TFile): Promise<void> {
+    const reason = this.diarizationUnavailableReason();
+    if (reason) {
+      new Notice(reason, 15000);
+      return;
+    }
+    if (this.diarizing.has(file.path)) {
+      new Notice(`Already assigning speakers to ${file.name}.`, 8000);
+      return;
+    }
+    if (this.normalizing.has(file.path)) {
+      new Notice(`${file.name} is being normalized; run this afterwards.`, 8000);
+      return;
+    }
+    const modelDir = this.resolveModelDir();
+    const pluginDir = this.resolvePluginDir();
+    if (!modelDir || !pluginDir) return;
+
+    this.diarizing.add(file.path);
+    const status = this.newStatusOwner("speakers");
+    // Sticky (timeout 0): updated per phase below and hidden in finally.
+    const notice = new Notice("Assigning speakers…", 0);
+    this.setStatus(status, "Assigning speakers…");
+    try {
+      const content = await this.app.vault.read(file);
+      const raw = extractTranscriptSection(content);
+      if (raw === null) {
+        new Notice(`No "## Transcript" section in ${file.name}.`, 10000);
+        return;
+      }
+      const channels = await this.readNoteAudio(file);
+      if (!channels) return;
+      const samples =
+        channels.length === 1
+          ? channels[0]
+          : downmixToMono(channels, channels[0].length);
+
+      notice.messageEl.setText("Assigning speakers… transcribing");
+      this.setStatus(status, "Transcribing for speakers…");
+      const structured = await transcribeLongWithTimestamps(
+        samples,
+        modelDir,
+        pluginDir,
+        16000,
+        {
+          onProgress: (done, total) => {
+            if (total <= 1) return;
+            notice.messageEl.setText(
+              `Assigning speakers… transcribing ${done}/${total}`,
+            );
+            this.setStatus(status, `Transcribing ${done}/${total}`);
+          },
+        },
+      );
+      if (!structured.text) {
+        new Notice(`No speech was recognized in the audio of ${file.name}.`, 10000);
+        return;
+      }
+      if (structured.words.length === 0) {
+        new Notice(
+          "The recognizer returned no word timestamps; speakers cannot be assigned.",
+          10000,
+        );
+        return;
+      }
+      const { text, speakers } = await this.labelSpeakers(
+        samples,
+        structured,
+        pluginDir,
+        status,
+        notice,
+      );
+      // Same optimistic guard as normalization: the note is re-read under
+      // Obsidian's write lock and left alone if its transcript changed.
+      let applied = false;
+      await this.app.vault.process(file, (current) => {
+        if (extractTranscriptSection(current) !== raw) return current;
+        applied = true;
+        return replaceTranscriptSection(current, text);
+      });
+      if (!applied) {
+        new Notice(
+          `The transcript in ${file.name} changed while speakers were ` +
+            "being assigned; nothing was applied. Run the command again.",
+          15000,
+        );
+        return;
+      }
+      await this.discardKeptAudio(file);
+      new Notice(
+        `Assigned speakers in ${file.name}${speakerSummary(speakers)}.`,
+        8000,
+      );
+    } catch (e) {
+      new Notice(`Speaker assignment failed: ${(e as Error).message}`, 15000);
+    } finally {
+      notice.hide();
+      this.setStatus(status, "");
+      this.diarizing.delete(file.path);
     }
   }
 
@@ -545,6 +1107,13 @@ export default class MeetingTranscriberPlugin extends Plugin {
       new Notice(`Already normalizing ${file.name}.`, 8000);
       return;
     }
+    if (this.diarizing.has(file.path)) {
+      new Notice(
+        `Speakers are being assigned to ${file.name}; run this afterwards.`,
+        8000,
+      );
+      return;
+    }
     this.normalizing.add(file.path);
     const status = this.newStatusOwner("normalize");
     // Sticky (timeout 0): updated per chunk below and hidden in finally.
@@ -561,7 +1130,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
         new Notice(`Nothing to normalize in ${file.name}.`, 8000);
         return;
       }
-      const result = await normalizeTranscript(this.settings, raw, {
+      const result = await normalizeSpeakerTranscript(this.settings, raw, {
         onProgress: ({ chunk, total }) => {
           notice.messageEl.setText(
             `Normalizing with S1-mini… chunk ${chunk}/${total}`,

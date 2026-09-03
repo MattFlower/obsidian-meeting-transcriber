@@ -1,4 +1,9 @@
 import {
+  parseSpeakerTranscript,
+  renderSpeakerTranscript,
+  type SpeakerTurn,
+} from "./speakers";
+import {
   callChatCompletion,
   ChatCompletionHttpError,
   type ChatMessage,
@@ -393,5 +398,80 @@ export async function normalizeTranscript(
     throw new Error(THINKING_HINT);
   }
   result.text = kept.join("\n\n");
+  return result;
+}
+
+/**
+ * Normalize a transcript that may carry speaker labels (`**Speaker 1:** …`
+ * paragraphs from the speaker pass). A plain transcript goes through
+ * `normalizeTranscript` unchanged. A labelled one is normalized turn by
+ * turn with the label kept outside the model's input, so labels survive and
+ * the model never sees two speakers' sentences as one passage. Turns of
+ * `GUARD_MIN_WORDS` words or fewer are kept verbatim without a model call:
+ * `normalizeTranscript` treats an empty reply to such a short passage as
+ * "nothing but filler", which would silently delete a "Yeah." reply.
+ * Progress counts chunks across all turns so the caller's counter stays
+ * monotonic.
+ */
+export async function normalizeSpeakerTranscript(
+  settings: NormalizerSettings,
+  transcript: string,
+  deps: NormalizerDeps = {},
+): Promise<NormalizeResult> {
+  const turns = parseSpeakerTranscript(transcript);
+  if (turns === null) return normalizeTranscript(settings, transcript, deps);
+
+  const eligible = turns.map((turn) => countWords(turn.text) > GUARD_MIN_WORDS);
+  const total = turns.reduce(
+    (n, turn, i) => n + (eligible[i] ? chunkTranscript(turn.text).length : 0),
+    0,
+  );
+  const result: NormalizeResult = {
+    text: "",
+    chunks: 0,
+    fallbackChunks: 0,
+    emptyChunks: 0,
+  };
+  const out: SpeakerTurn[] = [];
+  let offset = 0;
+  let anyText = false;
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i];
+    if (!eligible[i]) {
+      out.push(turn);
+      continue;
+    }
+    const onProgress = deps.onProgress;
+    const turnChunks = chunkTranscript(turn.text).length;
+    let turnResult: NormalizeResult;
+    try {
+      turnResult = await normalizeTranscript(settings, turn.text, {
+        ...deps,
+        onProgress: onProgress
+          ? ({ chunk }) => onProgress({ chunk: offset + chunk, total })
+          : undefined,
+      });
+    } catch (e) {
+      // `normalizeTranscript` treats an all-empty reply to a long passage
+      // as a misconfigured server. Per turn that is one turn's evidence,
+      // so keep its raw text and decide at the end, once every turn had
+      // its chance.
+      if (!(e instanceof Error) || e.message !== THINKING_HINT) throw e;
+      turnResult = {
+        text: "",
+        chunks: turnChunks,
+        fallbackChunks: turnChunks,
+        emptyChunks: turnChunks,
+      };
+    }
+    offset += turnResult.chunks;
+    result.chunks += turnResult.chunks;
+    result.fallbackChunks += turnResult.fallbackChunks;
+    result.emptyChunks += turnResult.emptyChunks;
+    if (turnResult.text) anyText = true;
+    out.push({ ...turn, text: turnResult.text || turn.text });
+  }
+  if (!anyText && eligible.some((e) => e)) throw new Error(THINKING_HINT);
+  result.text = renderSpeakerTranscript(out);
   return result;
 }

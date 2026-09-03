@@ -69,9 +69,17 @@ export class FakeCaptureNode {
 
 export class FakeSourceNode {
   connectCount = 0;
+  /** Every connect() call: the target node and the worklet input index. */
+  connections: { target: unknown; output?: number; input?: number }[] = [];
+  stream: unknown;
 
-  connect(): void {
+  constructor(stream?: unknown) {
+    this.stream = stream;
+  }
+
+  connect(target: unknown, output?: number, input?: number): void {
     this.connectCount++;
+    this.connections.push({ target, output, input });
   }
 
   disconnect(): void {
@@ -82,7 +90,8 @@ export class FakeSourceNode {
 export class FakeAudioContext {
   sampleRate: number;
   captureNode = new FakeCaptureNode();
-  sourceNode = new FakeSourceNode();
+  /** One node per createMediaStreamSource() call, in order. */
+  sourceNodes: FakeSourceNode[] = [];
   closed = false;
   destination = {};
 
@@ -90,8 +99,15 @@ export class FakeAudioContext {
     this.sampleRate = sampleRate;
   }
 
-  createMediaStreamSource(_stream: unknown): FakeSourceNode {
-    return this.sourceNode;
+  /** The first (for a single-source session, the only) source node. */
+  get sourceNode(): FakeSourceNode {
+    return this.sourceNodes[0];
+  }
+
+  createMediaStreamSource(stream: unknown): FakeSourceNode {
+    const node = new FakeSourceNode(stream);
+    this.sourceNodes.push(node);
+    return node;
   }
 
   async close(): Promise<void> {
@@ -102,8 +118,24 @@ export class FakeAudioContext {
 export interface FakeWorld {
   deps: LiveCaptureDeps;
   micStream: FakeStream;
+  /** Returned by getUserMedia for the device id `LOOPBACK_DEVICE_ID`. */
+  loopbackStream: FakeStream;
   displayStream: FakeStream;
   contexts: FakeAudioContext[];
+}
+
+/** Device id that makes the fake getUserMedia hand out `loopbackStream`. */
+export const LOOPBACK_DEVICE_ID = "loopback";
+
+function wantsLoopback(constraints: MediaStreamConstraints): boolean {
+  const audio = constraints.audio;
+  if (typeof audio !== "object" || audio === null) return false;
+  const deviceId = (audio as MediaTrackConstraints).deviceId;
+  return (
+    typeof deviceId === "object" &&
+    deviceId !== null &&
+    (deviceId as ConstrainDOMStringParameters).exact === LOOPBACK_DEVICE_ID
+  );
 }
 
 export function makeWorld(opts?: {
@@ -112,13 +144,16 @@ export function makeWorld(opts?: {
   workletThrows?: boolean;
 }): FakeWorld {
   const micStream = new FakeStream([new FakeTrack("audio")]);
+  const loopbackStream = new FakeStream([new FakeTrack("audio")]);
   const displayStream = new FakeStream([
     new FakeTrack("video"),
     ...(opts?.displayAudio === false ? [] : [new FakeTrack("audio")]),
   ]);
   const contexts: FakeAudioContext[] = [];
   const deps: LiveCaptureDeps = {
-    getUserMedia: vi.fn(async () => micStream),
+    getUserMedia: vi.fn(async (constraints: MediaStreamConstraints) =>
+      wantsLoopback(constraints) ? loopbackStream : micStream,
+    ),
     getDisplayMedia: opts?.displayThrows
       ? vi.fn(async () => {
           throw new Error("Permission denied");
@@ -139,10 +174,15 @@ export function makeWorld(opts?: {
             (context as FakeAudioContext).captureNode,
         ),
   };
-  return { deps, micStream, displayStream, contexts };
+  return { deps, micStream, loopbackStream, displayStream, contexts };
 }
 
 /** Deliver one frame of samples through the fake capture node's port. */
 export function feed(ctx: FakeAudioContext, samples: Float32Array): void {
   ctx.captureNode.port.onmessage!({ data: samples });
+}
+
+/** Deliver one two-lane frame (`{ lanes: [me, others] }`) through the port. */
+export function feedLanes(ctx: FakeAudioContext, lanes: Float32Array[]): void {
+  ctx.captureNode.port.onmessage!({ data: { lanes } });
 }

@@ -4,16 +4,26 @@ import {
   CAPTURE_PROCESSOR_NAME,
   CAPTURE_WORKLET_SOURCE,
   LIVE_SAMPLE_RATE,
+  isSilent,
+  laneLabel,
+  lanesForSource,
+  LOOPBACK_AUDIO_PROCESSING,
+  loopbackLane,
   LiveChunker,
   LiveRecordingSession,
   LiveSessionRegistry,
+  spreadWords,
   TranscriptOverlapDeduper,
+  type LiveFrame,
   type LiveSessionOwner,
+  type LiveWindow,
   SYSTEM_AUDIO_UNAVAILABLE,
 } from "../src/live";
 import {
   FakeAudioContext,
   feed,
+  feedLanes,
+  LOOPBACK_DEVICE_ID,
   makeWorld,
   type FakeWorld,
 } from "./helpers/fake-audio";
@@ -35,7 +45,8 @@ function makeSession(
     chunkSeconds: overrides?.chunkSeconds ?? 1,
     overlapSeconds: overrides?.overlapSeconds ?? 0,
     sampleRate: overrides?.sampleRate ?? 100,
-    onChunk: overrides?.onChunk ?? ((pcm) => chunks.push(pcm)),
+    onWindow: (window) =>
+      (overrides?.onChunk ?? ((pcm) => chunks.push(pcm)))(window.lanes.mixed!),
     onError: overrides?.onError ?? ((e) => errors.push(e)),
     clock: overrides?.clock,
   });
@@ -454,6 +465,7 @@ describe("LiveRecordingSession", () => {
     expect(world.deps.createCaptureNode).toHaveBeenCalledTimes(1);
     expect(world.deps.createCaptureNode).toHaveBeenCalledWith(
       world.contexts[0],
+      1,
     );
     await session.stop();
   });
@@ -597,7 +609,7 @@ describe("LiveRecordingSession", () => {
     const tail = await session.stop();
 
     expect(tail).not.toBeNull();
-    expect(tail!.length).toBe(120);
+    expect(tail!.lanes.mixed!.length).toBe(120);
     expect(world.micStream.tracks[0].stopped).toBe(true);
     expect(ctx.closed).toBe(true);
     expect(ctx.captureNode.disconnectCount).toBe(1);
@@ -681,7 +693,10 @@ describe("LiveRecordingSession", () => {
     expect(world.deps.getUserMedia).toHaveBeenCalledTimes(1);
     expect(world.deps.getDisplayMedia).not.toHaveBeenCalled();
     const constraint = world.deps.getUserMedia.mock.calls[0][0];
-    expect(constraint.audio).toEqual({ deviceId: { exact: "loopback-device-123" } });
+    expect(constraint.audio).toEqual({
+      deviceId: { exact: "loopback-device-123" },
+      ...LOOPBACK_AUDIO_PROCESSING,
+    });
     expect(session.isRecording()).toBe(true);
     await session.stop();
   });
@@ -741,7 +756,7 @@ describe("LiveRecordingSession", () => {
   it("uses the default 16 kHz model sample rate when none is given", async () => {
     const world = makeWorld();
     const session = new LiveRecordingSession(world.deps, {
-      onChunk: () => undefined,
+      onWindow: () => undefined,
       onError: () => undefined,
     });
     await session.start("microphone");
@@ -887,5 +902,277 @@ describe("CAPTURE_WORKLET_SOURCE", () => {
     expect(processor.process([])).toBe(true);
     expect(processor.process([[]])).toBe(true);
     expect(processor.port.messages).toHaveLength(0);
+  });
+});
+
+describe("LiveRecordingSession windows and lanes", () => {
+  it("numbers windows and places them on the timeline by the chunk step", async () => {
+    const world = makeWorld();
+    const windows: LiveWindow[] = [];
+    const session = new LiveRecordingSession(world.deps, {
+      sampleRate: 100,
+      chunkSeconds: 1,
+      overlapSeconds: 0.25,
+      onWindow: (window) => windows.push(window),
+      onError: () => undefined,
+    });
+    await session.start("microphone");
+    expect(session.getLanes()).toEqual(["mixed"]);
+    // 175 samples: chunk 0 at 0, chunk 1 at the 75-sample step (0.75 s).
+    feed(world.contexts[0], new Float32Array(175));
+    expect(windows.map((w) => w.index)).toEqual([0, 1]);
+    expect(windows.map((w) => w.startSeconds)).toEqual([0, 0.75]);
+    expect(Object.keys(windows[1].lanes)).toEqual(["mixed"]);
+    expect(windows[1].lanes.mixed!.length).toBe(100);
+    expect(await session.stop()).toBeNull(); // 25 samples left: under 1 s
+  });
+
+  it("reports every unpaused frame to onFrame before chunking", async () => {
+    const world = makeWorld();
+    const frames: LiveFrame[] = [];
+    const windows: LiveWindow[] = [];
+    const session = new LiveRecordingSession(world.deps, {
+      sampleRate: 100,
+      chunkSeconds: 1,
+      overlapSeconds: 0,
+      onWindow: (window) => windows.push(window),
+      onFrame: (frame) => {
+        // Frames precede the window they complete.
+        frames.push(frame);
+        expect(windows).toHaveLength(0);
+      },
+      onError: () => undefined,
+    });
+    await session.start("microphone");
+    const ctx = world.contexts[0];
+    feed(ctx, new Float32Array(30));
+    session.pause();
+    feed(ctx, new Float32Array(30)); // dropped, never reported
+    session.resume();
+    feed(ctx, new Float32Array(30));
+    expect(frames).toHaveLength(2);
+    expect(frames.map((f) => f.mixed!.length)).toEqual([30, 30]);
+    await session.stop();
+  });
+
+  it("captures microphone and loopback as sample-aligned lanes when both are selected", async () => {
+    const world = makeWorld();
+    const windows: LiveWindow[] = [];
+    const frames: LiveFrame[] = [];
+    const session = new LiveRecordingSession(world.deps, {
+      sampleRate: 100,
+      chunkSeconds: 1,
+      overlapSeconds: 0,
+      onWindow: (window) => windows.push(window),
+      onFrame: (frame) => frames.push(frame),
+      onError: () => undefined,
+    });
+    await session.start("both", LOOPBACK_DEVICE_ID, "mic-1");
+    expect(session.getLanes()).toEqual(["me", "others"]);
+    expect(world.deps.getUserMedia).toHaveBeenCalledTimes(2);
+    expect(world.deps.getUserMedia).toHaveBeenNthCalledWith(1, {
+      audio: { deviceId: { exact: "mic-1" } },
+      video: false,
+    });
+    expect(world.deps.getUserMedia).toHaveBeenNthCalledWith(2, {
+      audio: { deviceId: { exact: LOOPBACK_DEVICE_ID }, ...LOOPBACK_AUDIO_PROCESSING },
+      video: false,
+    });
+    expect(world.deps.getDisplayMedia).not.toHaveBeenCalled();
+
+    const ctx = world.contexts[0];
+    expect(world.deps.createCaptureNode).toHaveBeenCalledWith(ctx, 2);
+    expect(ctx.sourceNodes).toHaveLength(2);
+    expect(ctx.sourceNodes[0].stream).toBe(world.micStream);
+    expect(ctx.sourceNodes[1].stream).toBe(world.loopbackStream);
+    expect(ctx.sourceNodes[0].connections[0].input).toBe(0);
+    expect(ctx.sourceNodes[1].connections[0].input).toBe(1);
+
+    const me = new Float32Array(100).fill(0.1);
+    const others = new Float32Array(100).fill(0.2);
+    feedLanes(ctx, [me, others]);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].me).toBe(me);
+    expect(windows).toHaveLength(1);
+    expect(windows[0].lanes.me![0]).toBeCloseTo(0.1);
+    expect(windows[0].lanes.others![0]).toBeCloseTo(0.2);
+
+    // A bare mono frame is not a valid message for a two-lane session.
+    feed(ctx, new Float32Array(100));
+    expect(windows).toHaveLength(1);
+
+    session.pause();
+    expect(world.micStream.tracks[0].enabled).toBe(false);
+    expect(world.loopbackStream.tracks[0].enabled).toBe(false);
+    session.resume();
+    expect(world.loopbackStream.tracks[0].enabled).toBe(true);
+
+    feedLanes(ctx, [new Float32Array(120), new Float32Array(120)]);
+    expect(windows).toHaveLength(2);
+    expect(windows[1].startSeconds).toBe(1);
+
+    expect(await session.stop()).toBeNull(); // 20 samples left in each lane
+    expect(world.micStream.tracks[0].stopped).toBe(true);
+    expect(world.loopbackStream.tracks[0].stopped).toBe(true);
+  });
+
+  it("returns both lanes' tails in the final window", async () => {
+    const world = makeWorld();
+    const session = new LiveRecordingSession(world.deps, {
+      sampleRate: 100,
+      chunkSeconds: 2,
+      overlapSeconds: 0,
+      onWindow: () => undefined,
+      onError: () => undefined,
+    });
+    await session.start("both", LOOPBACK_DEVICE_ID);
+    feedLanes(world.contexts[0], [new Float32Array(320), new Float32Array(320)]);
+    const tail = await session.stop();
+    expect(tail).not.toBeNull();
+    expect(tail!.index).toBe(1);
+    expect(tail!.startSeconds).toBe(2);
+    expect(tail!.lanes.me!.length).toBe(120);
+    expect(tail!.lanes.others!.length).toBe(120);
+  });
+
+  it("releases the microphone when the loopback device cannot be opened", async () => {
+    const world = makeWorld();
+    vi.mocked(world.deps.getUserMedia)
+      .mockImplementationOnce(async () => world.micStream)
+      .mockImplementationOnce(async () => {
+        throw new Error("NotFoundError");
+      });
+    const session = makeSession(world);
+    await expect(session.start("both", "gone")).rejects.toThrow(/NotFoundError/);
+    expect(world.micStream.tracks[0].stopped).toBe(true);
+    expect(world.contexts).toHaveLength(0);
+    expect(session.isRecording()).toBe(false);
+  });
+
+  it("falls back to screen-share audio for the loopback lane without a device", async () => {
+    const world = makeWorld({ displayAudio: false });
+    const session = makeSession(world);
+    await expect(session.start("both")).rejects.toThrow(SYSTEM_AUDIO_UNAVAILABLE);
+    expect(world.micStream.tracks[0].stopped).toBe(true);
+  });
+});
+
+describe("lane helpers", () => {
+  it("names the lanes of each source and labels them", () => {
+    expect(lanesForSource("microphone")).toEqual(["mixed"]);
+    expect(lanesForSource("system")).toEqual(["mixed"]);
+    expect(lanesForSource("both")).toEqual(["me", "others"]);
+    expect(laneLabel("me")).toBe("Me");
+    expect(laneLabel("others")).toBe("Others");
+    expect(laneLabel("mixed")).toBe("");
+  });
+
+  it("names the loopback lane of each source", () => {
+    expect(loopbackLane("microphone")).toBeNull();
+    expect(loopbackLane("system")).toBe("mixed");
+    expect(loopbackLane("both")).toBe("others");
+  });
+
+  it("isSilent is true only for digital silence", () => {
+    expect(isSilent(new Float32Array(100))).toBe(true);
+    const faint = new Float32Array(100);
+    faint[50] = 0.00005;
+    expect(isSilent(faint)).toBe(true);
+    faint[51] = -0.001;
+    expect(isSilent(faint)).toBe(false);
+    expect(isSilent(new Float32Array(0))).toBe(true);
+  });
+
+  it("spreadWords spaces the words evenly over the chunk", () => {
+    expect(spreadWords("a  b c d", 2)).toEqual([
+      { text: "a", start: 0, end: 0.5 },
+      { text: "b", start: 0.5, end: 1 },
+      { text: "c", start: 1, end: 1.5 },
+      { text: "d", start: 1.5, end: 2 },
+    ]);
+    expect(spreadWords("   ", 2)).toEqual([]);
+  });
+});
+
+describe("TranscriptOverlapDeduper.appendWords", () => {
+  it("drops the words the previous chunk already emitted and keeps their payload", () => {
+    const d = new TranscriptOverlapDeduper();
+    const first = d.appendWords([
+      { text: "we", t: 1 },
+      { text: "will", t: 2 },
+      { text: "start", t: 3 },
+    ]);
+    expect(first.map((w) => w.t)).toEqual([1, 2, 3]);
+    const second = d.appendWords([
+      { text: "will", t: 4 },
+      { text: "start", t: 5 },
+      { text: "now", t: 6 },
+    ]);
+    expect(second).toEqual([{ text: "now", t: 6 }]);
+    expect(d.takeCorrection()).toBeNull();
+  });
+
+  it("reports a clipped-word correction exactly as append() does", () => {
+    const d = new TranscriptOverlapDeduper();
+    d.appendWords([{ text: "we" }, { text: "will" }, { text: "transcri" }]);
+    const out = d.appendWords([
+      { text: "will" },
+      { text: "transcription" },
+      { text: "now" },
+    ]);
+    expect(out.map((w) => w.text)).toEqual(["now"]);
+    expect(d.takeCorrection()).toEqual({
+      previous: "transcri",
+      replacement: "transcription",
+    });
+  });
+
+  it("shares its tail between the text and word forms", () => {
+    const d = new TranscriptOverlapDeduper();
+    expect(d.append("one two three")).toBe("one two three");
+    expect(d.appendWords([{ text: "two" }, { text: "three" }, { text: "four" }])).toEqual([
+      { text: "four" },
+    ]);
+  });
+});
+
+describe("CAPTURE_WORKLET_SOURCE with two inputs", () => {
+  it("posts both lanes together, cut from the same quanta and transferred", () => {
+    const Processor = loadWorkletProcessors()[CAPTURE_PROCESSOR_NAME];
+    const processor = new Processor();
+    const quantaPerFrame = CAPTURE_FRAME_SAMPLES / 128;
+    for (let i = 0; i < quantaPerFrame; i++) {
+      processor.process([[quantum(i * 128)], [quantum(1000 + i * 128)]]);
+    }
+    expect(processor.port.messages).toHaveLength(1);
+    const message = processor.port.messages[0] as unknown as {
+      lanes: Float32Array[];
+    };
+    expect(message.lanes).toHaveLength(2);
+    expect(message.lanes[0][0]).toBe(0);
+    expect(message.lanes[0][CAPTURE_FRAME_SAMPLES - 1]).toBe(CAPTURE_FRAME_SAMPLES - 1);
+    expect(message.lanes[1][0]).toBe(1000);
+    expect(message.lanes[1][CAPTURE_FRAME_SAMPLES - 1]).toBe(
+      1000 + CAPTURE_FRAME_SAMPLES - 1,
+    );
+    expect(processor.port.transfers[0]).toEqual([
+      message.lanes[0].buffer,
+      message.lanes[1].buffer,
+    ]);
+  });
+
+  it("fills an input with nothing connected with silence", () => {
+    const Processor = loadWorkletProcessors()[CAPTURE_PROCESSOR_NAME];
+    const processor = new Processor();
+    const quantaPerFrame = CAPTURE_FRAME_SAMPLES / 128;
+    for (let i = 0; i < quantaPerFrame; i++) {
+      processor.process([[quantum(1 + i * 128)], []]);
+    }
+    const message = processor.port.messages[0] as unknown as {
+      lanes: Float32Array[];
+    };
+    expect(message.lanes[0][0]).toBe(1);
+    expect(message.lanes[1].every((v) => v === 0)).toBe(true);
+    expect(message.lanes[1].length).toBe(CAPTURE_FRAME_SAMPLES);
   });
 });

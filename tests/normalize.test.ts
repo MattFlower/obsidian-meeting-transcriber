@@ -13,6 +13,7 @@ import {
   type NormalizerSettings,
   type NormalizerStructure,
   type NormalizerStyling,
+  normalizeSpeakerTranscript,
 } from "../src/normalize";
 
 const settings: NormalizerSettings = {
@@ -386,5 +387,95 @@ describe("normalizeTranscript errors", () => {
     await expect(
       normalizeTranscript(settings, "hi", { fetchImpl, timeoutMs: 10 }),
     ).rejects.toThrow(/timed out after 1 s/);
+  });
+});
+
+
+describe("normalizeSpeakerTranscript", () => {
+  function echoBackend(seen: string[]): NormalizeBackend {
+    return async ({ messages }) => {
+      const t = transcriptOf(messages[1].content);
+      seen.push(t);
+      return `[${t}]`;
+    };
+  }
+
+  it("delegates a plain transcript to normalizeTranscript unchanged", async () => {
+    const seen: string[] = [];
+    const text = words(30);
+    const result = await normalizeSpeakerTranscript(settings, text, {
+      backend: echoBackend(seen),
+    });
+    expect(seen).toEqual([text]);
+    expect(result.text).toBe(`[${text}]`);
+    expect(result.chunks).toBe(1);
+  });
+
+  it("keeps short turns verbatim and normalizes long turns with labels reattached", async () => {
+    const seen: string[] = [];
+    const first = words(30, "a");
+    const third = words(25, "b");
+    const transcript = `**Speaker 1:** ${first}\n\n**Speaker 2:** Yeah.\n\n**Alice:** ${third}`;
+    const result = await normalizeSpeakerTranscript(settings, transcript, {
+      backend: echoBackend(seen),
+    });
+    expect(seen).toEqual([first, third]);
+    expect(result.text).toBe(
+      `**Speaker 1:** [${first}]\n\n**Speaker 2:** Yeah.\n\n**Alice:** [${third}]`,
+    );
+    expect(result.chunks).toBe(2);
+  });
+
+  it("reports progress monotonically across turns", async () => {
+    const backend: NormalizeBackend = async ({ messages }) =>
+      transcriptOf(messages[1].content);
+    const progress: string[] = [];
+    // 600 words without punctuation hard-split into two chunks per turn.
+    const turn = words(600);
+    await normalizeSpeakerTranscript(settings, `**A:** ${turn}\n\n**B:** ${turn}`, {
+      backend,
+      onProgress: (p) => progress.push(`${p.chunk}/${p.total}`),
+    });
+    expect(progress).toEqual(["1/4", "2/4", "3/4", "4/4"]);
+  });
+
+  it("keeps a turn raw when only that turn comes back empty", async () => {
+    let calls = 0;
+    const backend: NormalizeBackend = async ({ messages }) => {
+      calls++;
+      return calls === 1 ? "" : transcriptOf(messages[1].content);
+    };
+    const a = words(30, "a");
+    const b = words(30, "b");
+    const result = await normalizeSpeakerTranscript(settings, `**A:** ${a}\n\n**B:** ${b}`, {
+      backend,
+    });
+    expect(result.text).toBe(`**A:** ${a}\n\n**B:** ${b}`);
+    expect(result.fallbackChunks).toBe(1);
+    expect(result.emptyChunks).toBe(1);
+  });
+
+  it("raises the thinking hint when every long turn comes back empty", async () => {
+    const backend: NormalizeBackend = async () => "";
+    await expect(
+      normalizeSpeakerTranscript(settings, `**A:** ${words(30)}\n\n**B:** Yes.`, {
+        backend,
+      }),
+    ).rejects.toThrow(/thinking/i);
+  });
+
+  it("turns a multi-paragraph reply into continuation paragraphs under one label", async () => {
+    const backend: NormalizeBackend = async ({ messages }) => {
+      const ws = transcriptOf(messages[1].content).split(" ");
+      return `${ws.slice(0, 10).join(" ")}\n\n${ws.slice(10).join(" ")}`;
+    };
+    const long = words(30);
+    const ws = long.split(" ");
+    const result = await normalizeSpeakerTranscript(settings, `**A:** ${long}`, {
+      backend,
+    });
+    expect(result.text).toBe(
+      `**A:** ${ws.slice(0, 10).join(" ")}\n\n${ws.slice(10).join(" ")}`,
+    );
   });
 });

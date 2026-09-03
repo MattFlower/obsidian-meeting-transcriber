@@ -41,20 +41,35 @@ normalization* below).
   text (see *Text normalization* below).
 - **Meeting Transcriber: Transcribe live meeting (record audio)** — opens the
   live-recording modal (also available as the microphone ribbon icon): record
-  microphone or system audio and have the transcript appended to a note in
-  the output folder **as the meeting is spoken** (see *Live recording* below).
+  microphone audio, system audio, or both and have the transcript appended
+  to a note in the output folder **as the meeting is spoken** (see *Live
+  recording* below).
+- **Meeting Transcriber: Download diarization models** — fetches the
+  pyannote segmentation 3.0 (int8) and NeMo TitaNet-small speaker-embedding
+  models (~42 MB) from Hugging Face into the diarization model directory
+  (see *Speaker diarization* below).
+- **Meeting Transcriber: Assign speakers to transcript** — run on the active
+  note (or pick one from the output folder); re-transcribes the note's audio
+  with word timestamps, labels who is speaking, and replaces the
+  `## Transcript` section with `**Speaker N:**` turns (see *Speaker
+  diarization* below).
 
 ## Live recording
 
 The **Transcribe live meeting** command (or the microphone ribbon icon) opens
 a modal that runs a live recording session:
 
-1. Pick the **audio source**: *Microphone* or *System audio*.
+1. Pick the **audio source**: *Microphone*, *System audio*, or *Microphone +
+   system audio* (your microphone and a loopback device captured together,
+   see *Who said what* below).
 2. Pick the **input device** (defaults to *System default*; loopback devices
-   for system audio are selected here — see below).
+   for system audio are selected here — see below). With *Microphone + system
+   audio* there are two: the microphone and the system audio (loopback)
+   device.
 3. Press **Start recording**. A note named
    `YYYY-MM-DD HHmm Live recording (<source>).md` is created in the output
-   folder immediately, with `source: live-<source>` in its frontmatter.
+   folder immediately, with `source: live-microphone`, `live-system` or
+   `live-both` in its frontmatter.
 4. Audio is captured at 16 kHz mono and cut into chunks (default 15 s,
    configurable in settings). Each finished chunk is transcribed with the
    local Parakeet model and appended to the note's `## Transcript` section
@@ -70,6 +85,22 @@ a modal that runs a live recording session:
 A status line in the modal and the Obsidian status bar show the elapsed
 (unpaused) time and when a chunk is being transcribed.
 
+**Who said what.** With *Microphone + system audio*, the two inputs go
+through one capture worklet, so they stay sample-aligned, and each is
+transcribed on its own: your words land in the note as `**Me:**` paragraphs
+and the other side's as `**Others:**` paragraphs, in the order they were
+spoken; a speaker who keeps talking across two chunks stays in one paragraph.
+Wear headphones — otherwise the microphone hears the other side through your
+speakers and their words show up under `Me` as well — and route the meeting's
+sound into the loopback device (see *System audio capture*: on macOS a
+Multi-Output Device with your headphones and BlackHole), or the `Others` lane
+stays silent. The browser's echo cancellation, noise suppression and gain
+control are switched off for the loopback device. When **Assign speakers
+to transcripts** is on (see *Speaker diarization*), the session also records
+its audio to a temporary file and, once it stops, splits `Others` into
+`Speaker 1`, `Speaker 2`, … (or, for a single-source session, labels every
+speaker) before any S1-mini normalization.
+
 Only **one live recording session can be active at a time** across the whole
 plugin: opening the modal or pressing **Start recording** while another
 session is still recording shows a notice and is refused. The restriction is
@@ -82,11 +113,20 @@ host does not expose system output the way it exposes a microphone. The
 plugin handles it honestly, per platform:
 
 - **macOS** — install a loopback driver such as
-  [BlackHole](https://existential.audio/blackhole/) (or use the built-in
-  *Audio MIDI Setup* aggregate/loopback), route the app audio you want to
-  capture into it, then select that loopback device in the modal's *Input
-  device* dropdown. On macOS 13+ with screen-recording permission granted,
-  screen sharing may also provide a system-audio track directly.
+  [BlackHole](https://existential.audio/blackhole/), then **route the sound
+  into it**: selecting BlackHole in the plugin only captures *from* it, and
+  a BlackHole nothing is sent to is silent. So that you still hear the
+  meeting, open *Audio MIDI Setup*, click **+** → **Create Multi-Output
+  Device**, tick your headphones or speakers (AirPods included) *and*
+  *BlackHole 2ch*, and choose that Multi-Output Device as the output — either
+  system-wide (Control Center / System Settings → Sound → Output) or just in
+  the meeting app's speaker setting. Keep *BlackHole 2ch* selected as the
+  plugin's loopback device and your real microphone as the microphone. A
+  Multi-Output Device has no volume slider of its own; set the volume on
+  the headphones before switching. If the loopback device stays silent for
+  two chunks, the plugin says so in a notice. On macOS 13+ with
+  screen-recording permission granted, screen sharing may also provide a
+  system-audio track directly.
 - **Windows** — select *Stereo Mix* or a virtual cable (e.g. VB-CABLE) as
   the input device, or use screen-share audio when your Windows build
   provides it via the share prompt.
@@ -239,6 +279,55 @@ the weights; you download them from Hugging Face under that license. See the
 model's [LICENSE](https://huggingface.co/superwhisper/s1-mini/blob/main/LICENSE)
 and [NOTICE](https://huggingface.co/superwhisper/s1-mini/blob/main/NOTICE).
 
+## Speaker diarization
+
+Parakeet writes down the words; it does not know who said them. The plugin
+can label the speakers afterwards with a local diarization pipeline that
+ships inside `sherpa-onnx-node`: [pyannote segmentation
+3.0](https://huggingface.co/pyannote/segmentation-3.0) finds who speaks
+when, [NVIDIA TitaNet-small](https://huggingface.co/csukuangfj/speaker-embedding-models)
+turns each stretch of speech into a voice embedding, and clustering groups
+the stretches into speakers. Parakeet's own word timestamps then place every
+word in a speaker's turn.
+
+Enable **Assign speakers to transcripts** in the settings and run **Download
+diarization models** once (two files, ~42 MB, into `models/diarization`).
+Then:
+
+- **Audio files** are transcribed and labelled in one go: the `## Transcript`
+  section becomes one paragraph per turn — `**Speaker 1:** …`,
+  `**Speaker 2:** …` — numbered in order of first appearance. When only one
+  voice is found, the transcript stays unlabelled and is split into
+  paragraphs at pauses instead.
+- **Live recordings** are labelled when the session stops. While it runs, the
+  audio is written to a temporary WAV outside the vault
+  (`<system temp dir>/obsidian-meeting-transcriber/`, ~115 MB per hour at
+  16 kHz mono; paused spans are not recorded). The pass runs on that file
+  after "Live recording stopped." using the words already transcribed, then
+  deletes the file. If the pass fails, the file is kept and its path is
+  stored in the note's `audio:` frontmatter so the command below can retry;
+  a successful retry deletes it.
+- **Assign speakers to transcript** runs the pass on demand on the active
+  note (or one picked from the output folder). It re-transcribes the audio
+  the note's frontmatter points at — `source:` for a vault audio file,
+  `audio:` for a kept live recording — with timestamps, in ten-minute
+  windows cut at quiet points for long recordings. A re-run resets speaker
+  names you edited by hand back to `Speaker N`.
+
+Two settings tune the clustering. **Number of speakers** is `0` to detect the
+count automatically; any other value is used as the *exact* number of
+speakers, not a maximum, so set it only when you know how many people spoke.
+**Clustering threshold** (default `0.5`) applies to automatic detection: raise
+it if one person is split into several speakers, lower it if two people are
+merged into one.
+
+Diarization runs after transcription and before S1-mini normalization; the
+normalizer then works turn by turn, so labels survive it and short replies
+("Yeah.") are kept verbatim. Overlapping speech goes to the speaker who covers
+more of each word. Expect the pass to take roughly a tenth of the recording's
+length on one CPU core. See the model cards linked above for the models'
+licences.
+
 ## Setup
 
 1. Enable the plugin in a desktop vault.
@@ -251,6 +340,9 @@ and [NOTICE](https://huggingface.co/superwhisper/s1-mini/blob/main/NOTICE).
 4. Optionally, serve S1-mini by Superwhisper on a local model server and
    enable **Normalize transcripts with S1-mini by Superwhisper** in the
    plugin settings (see *Text normalization* above).
+5. Optionally, enable **Assign speakers to transcripts** and run **Download
+   diarization models** (one-time, ~42 MB) to label who is speaking (see
+   *Speaker diarization* above).
 
 ## Settings
 
@@ -266,8 +358,13 @@ and [NOTICE](https://huggingface.co/superwhisper/s1-mini/blob/main/NOTICE).
 | Local LLM model | `llama3.1` | Model name sent to the local server |
 | CLI command | `claude -p` | Command that reads the prompt on stdin and prints the answer. Homebrew, `/usr/local/bin`, `~/.local/bin` and npm-global directories are searched; if the command is still not found, give an absolute path (quoted if it contains spaces) |
 | Default tags | `meeting` | Comma-separated tags for new notes |
-| Live recording source | `microphone` | Pre-selected source for the live-recording modal; system audio requires a loopback device on most platforms (see *System audio capture*) |
+| Live recording source | `microphone` | Pre-selected source for the live-recording modal: `microphone`, `system`, or `both` (microphone + loopback device, labelled `Me` / `Others`); system audio requires a loopback device on most platforms (see *System audio capture*) |
 | Live chunk length (seconds) | `15` | How often live audio is transcribed and appended to the note (5–60) |
+| Assign speakers to transcripts | off | Master switch for speaker diarization (see *Speaker diarization*) |
+| Diarization model directory | `models/diarization` | Vault-relative folder with the segmentation and embedding models |
+| Number of speakers | `0` | `0` detects the count automatically; any other value is the exact number of speakers |
+| Clustering threshold | `0.5` | For automatic detection: raise it if one person is split, lower it if two are merged |
+| Assign speakers to live recordings when they stop | on | Record a live session's audio to a temporary file outside the vault and run the pass when it stops (when the master switch is on) |
 | Normalize transcripts with S1-mini by Superwhisper | off | Master switch for transcript normalization (see *Text normalization*) |
 | S1-mini server URL | `http://localhost:11434/v1` | Local OpenAI-compatible server running S1-mini (Ollama, llama-server, LM Studio) |
 | S1-mini API key | *(empty)* | Optional Bearer token; not needed for local servers |
@@ -319,10 +416,17 @@ plugin.
   prebuild, a fallback is to run the transcription in a child process:
   spawn `process.execPath` with `ELECTRON_RUN_AS_NODE=1` and a small helper
   script that performs the same decode.
-- No speaker diarization (out of scope). Live recording transcribes in
-  ~15 s chunks with the offline (non-streaming) Parakeet model, so there is
-  a short delay between speech and the text appearing in the note; words
-  split across chunk boundaries may occasionally be duplicated at the seam.
+- Speaker labels are assigned after the fact — when a file is transcribed,
+  when a live session stops, or on demand — never while a chunk is spoken;
+  during a live session the only labels are `Me` / `Others` from capturing
+  the microphone and system audio separately. Diarization quality depends on
+  the recording: overlapping speech, very short utterances and similar
+  voices are the usual sources of wrong labels, and a re-run of the pass
+  resets hand-edited speaker names.
+- Live recording transcribes in ~15 s chunks with the offline
+  (non-streaming) Parakeet model, so there is a short delay between speech
+  and the text appearing in the note; words split across chunk boundaries
+  may occasionally be duplicated at the seam.
 - System audio capture depends on platform loopback facilities — see
   *System audio capture* above.
 - Transcription of long recordings is CPU-bound and can take several minutes;

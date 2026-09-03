@@ -17,7 +17,11 @@ import {
   missingModelFilesMessage,
   modelFilePaths,
   releaseRecognizer,
+  splitAtQuietPoints,
   transcribe,
+  transcribeLongWithTimestamps,
+  transcribeWithTimestamps,
+  wordsFromTokens,
 } from "../src/transcriber";
 
 /**
@@ -32,6 +36,7 @@ let lastWaveform;
 let constructed = 0;
 let createdAsync = 0;
 let failNextCreate = false;
+let nextResult = null;
 
 class OfflineRecognizer {
   constructor(config) {
@@ -54,7 +59,7 @@ class OfflineRecognizer {
     };
   }
   async decodeAsync(stream) {
-    return { text: "  hello world  " };
+    return nextResult ?? { text: "  hello world  " };
   }
 }
 
@@ -65,12 +70,14 @@ module.exports = {
   getLastWaveform: () => lastWaveform,
   counts: () => ({ constructed, createdAsync }),
   failNextCreate: () => { failNextCreate = true; },
+  setNextResult: (result) => { nextResult = result; },
   reset: () => {
     lastConfig = undefined;
     lastWaveform = undefined;
     constructed = 0;
     createdAsync = 0;
     failNextCreate = false;
+    nextResult = null;
   },
 };
 `;
@@ -205,6 +212,136 @@ describe("transcribe with the plugin-directory recognizer", () => {
     );
     expect(await transcribe(pcm, modelDir, pluginDir)).toBe("hello world");
     expect(sherpa.counts()).toEqual({ constructed: 1, createdAsync: 2 });
+  });
+
+  it("transcribeWithTimestamps returns the words the tokens spell", async () => {
+    loadSherpaOnnx(pluginDir).setNextResult({
+      text: " Hello there. ",
+      tokens: [" Hello", " there", "."],
+      timestamps: [0.1, 0.5, 0.7],
+      durations: [],
+    });
+    const result = await transcribeWithTimestamps(pcm, modelDir, pluginDir);
+    expect(result.text).toBe("Hello there.");
+    // `pcm` is one second long, so the last word is capped there.
+    expect(result.words).toEqual([
+      { text: "Hello", start: 0.1, end: 0.5 },
+      { text: "there.", start: 0.5, end: 1 },
+    ]);
+  });
+
+  it("transcribeWithTimestamps yields no words when the result carries no timestamps", async () => {
+    const result = await transcribeWithTimestamps(pcm, modelDir, pluginDir);
+    expect(result).toEqual({ text: "hello world", words: [] });
+  });
+
+  it("transcribeLongWithTimestamps decodes windows and shifts word times", async () => {
+    loadSherpaOnnx(pluginDir).setNextResult({
+      text: "one",
+      tokens: [" one"],
+      timestamps: [0.25],
+      durations: [],
+    });
+    const progress: string[] = [];
+    const result = await transcribeLongWithTimestamps(
+      new Float32Array(16000 * 5),
+      modelDir,
+      pluginDir,
+      16000,
+      {
+        maxSeconds: 2,
+        searchSeconds: 0.5,
+        onProgress: (done, total) => progress.push(`${done}/${total}`),
+      },
+    );
+    // Silence everywhere, so each cut lands 50 ms into the search span:
+    // windows start at 0, 1.55 s and 3.1 s.
+    expect(result.text).toBe("one one one");
+    expect(result.words.map((w) => w.text)).toEqual(["one", "one", "one"]);
+    expect(result.words[0].start).toBeCloseTo(0.25, 5);
+    expect(result.words[1].start).toBeCloseTo(1.8, 5);
+    expect(result.words[2].start).toBeCloseTo(3.35, 5);
+    expect(progress).toEqual(["1/3", "2/3", "3/3"]);
+  });
+});
+
+describe("wordsFromTokens", () => {
+  it("starts a word at a piece with a leading space or ▁ and extends it otherwise", () => {
+    const words = wordsFromTokens(
+      [" Well", ",", " I", " don", "'", "t", "▁know"],
+      [0.32, 0.64, 0.72, 0.8, 0.88, 0.96, 1.2],
+      [],
+      2,
+    );
+    expect(words.map((w) => w.text)).toEqual(["Well,", "I", "don't", "know"]);
+    expect(words.map((w) => w.start)).toEqual([0.32, 0.72, 0.8, 1.2]);
+  });
+
+  it("ends a word where the next starts, capped at maxWordSeconds and the audio length", () => {
+    const words = wordsFromTokens([" a", " b", " c"], [0, 0.5, 3], [], 3.2);
+    expect(words.map((w) => w.end)).toEqual([0.5, 1.5, 3.2]);
+  });
+
+  it("uses durations when the recognizer reports them", () => {
+    const words = wordsFromTokens(
+      [" a", "b", " c"],
+      [0, 0.2, 1],
+      [0.1, 0.3, 0.4],
+      5,
+    );
+    expect(words).toEqual([
+      { text: "ab", start: 0, end: 0.5 },
+      { text: "c", start: 1, end: 1.4 },
+    ]);
+  });
+
+  it("returns no words when the arrays are absent or inconsistent", () => {
+    expect(wordsFromTokens(undefined, undefined, undefined, 1)).toEqual([]);
+    expect(wordsFromTokens([" a"], [], [], 1)).toEqual([]);
+    expect(wordsFromTokens([], [], [], 1)).toEqual([]);
+  });
+
+  it("treats a space-only piece as a word boundary and starts without a space", () => {
+    const words = wordsFromTokens(["Hi", " ", "there"], [0, 0.1, 0.2], [], 1);
+    expect(words).toEqual([
+      { text: "Hi", start: 0, end: 0.2 },
+      { text: "there", start: 0.2, end: 1 },
+    ]);
+  });
+
+  it("never yields an end before the start", () => {
+    const words = wordsFromTokens([" a", " b"], [1, 0.5], [], 2);
+    expect(words[0]).toEqual({ text: "a", start: 1, end: 1 });
+  });
+});
+
+describe("splitAtQuietPoints", () => {
+  it("returns a single window for audio within the limit", () => {
+    expect(splitAtQuietPoints(new Float32Array(100), 100, 2, 1)).toEqual([
+      0, 100,
+    ]);
+  });
+
+  it("cuts at the quietest point before the window limit", () => {
+    const rate = 1000;
+    const pcm = new Float32Array(rate * 5).fill(0.5);
+    pcm.fill(0, 1600, 1800); // silence from 1.6 s to 1.8 s
+    const bounds = splitAtQuietPoints(pcm, rate, 2, 1);
+    expect(bounds[0]).toBe(0);
+    expect(bounds[1]).toBeGreaterThanOrEqual(1600);
+    expect(bounds[1]).toBeLessThanOrEqual(1800);
+    expect(bounds[bounds.length - 1]).toBe(pcm.length);
+  });
+
+  it("never produces a window longer than the limit", () => {
+    const rate = 1000;
+    const pcm = new Float32Array(rate * 7).fill(0.3);
+    const bounds = splitAtQuietPoints(pcm, rate, 2, 0.5);
+    for (let i = 1; i < bounds.length; i++) {
+      expect(bounds[i] - bounds[i - 1]).toBeLessThanOrEqual(2000);
+      expect(bounds[i]).toBeGreaterThan(bounds[i - 1]);
+    }
+    expect(bounds[bounds.length - 1]).toBe(7000);
   });
 });
 

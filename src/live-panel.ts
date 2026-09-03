@@ -3,6 +3,7 @@ import { ItemView, Notice, TFile, WorkspaceLeaf } from "obsidian";
 import {
   CAPTURE_PROCESSOR_NAME,
   CAPTURE_WORKLET_SOURCE,
+  dropLoopbackBleed,
   isSilent,
   laneLabel,
   lanesForSource,
@@ -927,16 +928,20 @@ export class LiveRecordingPanel extends ItemView implements LiveSessionOwner {
           });
         }
       }
-      if (words.length === 0 && corrections.length === 0) return;
       // Array.prototype.sort is stable, so a lane's own order is kept.
       words.sort((a, b) => a.start - b.start);
-      this.sessionWords.push(...words);
+      // Without headphones the microphone repeats the far end; drop that
+      // echo before it reaches the note or the speaker pass.
+      const kept =
+        this.activeSource === "both" ? dropLoopbackBleed(words) : words;
+      if (kept.length === 0 && corrections.length === 0) return;
+      this.sessionWords.push(...kept);
       // Lane labels are ground truth, so no tiny-turn smoothing here.
       const turns =
-        words.length > 0
+        kept.length > 0
           ? buildTurns(
-              words,
-              words.map((word) => laneLabel(word.lane)),
+              kept,
+              kept.map((word) => laneLabel(word.lane)),
               { minTurnWords: 1 },
             )
           : [];

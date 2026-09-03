@@ -767,4 +767,57 @@ describe("LiveRecordingPanel speaker pass on stop", () => {
     await settle();
     expect(transcribeWithTimestampsMock).toHaveBeenCalledTimes(5);
   });
+
+  it("drops the microphone's echo of the far end before the note and the speaker pass", async () => {
+    const h = makeHarness({ settings: speakersOn });
+    await h.panel.onOpen();
+    await settle();
+    const { source, device } = h.selects();
+    source.value = "both";
+    device.value = LOOPBACK_DEVICE_ID;
+    h.buttons().startStop.click();
+    await settle();
+    const ctx = h.world.contexts[0];
+    const audible = new Float32Array(16000 * 15).fill(0.1);
+    transcribeWithTimestampsMock
+      .mockResolvedValueOnce({
+        // Microphone: the far end through the speakers, then a real reply.
+        text: "we should ship it. Agreed, tomorrow.",
+        words: [
+          { text: "we", start: 0.05, end: 0.2 },
+          { text: "should", start: 0.35, end: 0.5 },
+          { text: "ship", start: 0.65, end: 0.8 },
+          { text: "it.", start: 0.95, end: 1.1 },
+          { text: "Agreed,", start: 2.0, end: 2.3 },
+          { text: "tomorrow.", start: 2.3, end: 2.7 },
+        ],
+      })
+      .mockResolvedValueOnce({
+        text: "We should ship it.",
+        words: [
+          { text: "We", start: 0, end: 0.2 },
+          { text: "should", start: 0.3, end: 0.5 },
+          { text: "ship", start: 0.6, end: 0.8 },
+          { text: "it.", start: 0.9, end: 1.1 },
+        ],
+      });
+    feedLanes(ctx, [audible, audible]);
+    await settle();
+    expect(h.written[0]).toContain(
+      "**Others:** We should ship it.\n\n**Me:** Agreed, tomorrow.",
+    );
+    expect(h.written[0]).not.toContain("**Me:** we should");
+
+    h.buttons().startStop.click();
+    await settle();
+    const [, sourceArg] = h.assignSpeakers.mock.calls[0] as [TFile, LiveSpeakerSource];
+    expect(sourceArg.words.map((w) => `${w.lane}:${w.text}`)).toEqual([
+      "others:We",
+      "others:should",
+      "others:ship",
+      "others:it.",
+      "me:Agreed,",
+      "me:tomorrow.",
+    ]);
+  });
 });

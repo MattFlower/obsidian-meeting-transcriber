@@ -4,6 +4,7 @@ import {
   CAPTURE_PROCESSOR_NAME,
   CAPTURE_WORKLET_SOURCE,
   LIVE_SAMPLE_RATE,
+  dropLoopbackBleed,
   isSilent,
   laneLabel,
   lanesForSource,
@@ -14,6 +15,7 @@ import {
   LiveSessionRegistry,
   spreadWords,
   TranscriptOverlapDeduper,
+  type LaneWord,
   type LiveFrame,
   type LiveSessionOwner,
   type LiveWindow,
@@ -1174,5 +1176,96 @@ describe("CAPTURE_WORKLET_SOURCE with two inputs", () => {
     expect(message.lanes[0][0]).toBe(1);
     expect(message.lanes[1].every((v) => v === 0)).toBe(true);
     expect(message.lanes[1].length).toBe(CAPTURE_FRAME_SAMPLES);
+  });
+});
+
+describe("dropLoopbackBleed", () => {
+  /** Words at `starts` (seconds), 0.2 s long each, on one lane. */
+  function lane(
+    which: LaneWord["lane"],
+    text: string,
+    starts: number[],
+  ): LaneWord[] {
+    return text.split(" ").map((t, i) => ({
+      text: t,
+      start: starts[i],
+      end: starts[i] + 0.2,
+      lane: which,
+    }));
+  }
+  const byTime = (words: LaneWord[]) =>
+    words.slice().sort((a, b) => a.start - b.start);
+  const show = (words: LaneWord[]) =>
+    words.map((w) => `${w.lane}:${w.text}`).join(" ");
+
+  it("drops the microphone's copy of a run of far-end words", () => {
+    // The pattern from a real speakers-only session: every far-end word
+    // comes back on the microphone a few tens of milliseconds later.
+    const words = byTime([
+      ...lane("others", "Because now we're referencing variables", [0, 0.4, 0.8, 1.2, 1.6]),
+      ...lane("me", "because now we're referencing variables.", [0.05, 0.45, 0.85, 1.25, 1.65]),
+    ]);
+    expect(show(dropLoopbackBleed(words))).toBe(
+      "others:Because others:now others:we're others:referencing others:variables",
+    );
+  });
+
+  it("drops an echo timestamped slightly before the loopback copy too", () => {
+    const words = byTime([
+      ...lane("me", "because now", [0, 0.4]),
+      ...lane("others", "Because now", [0.06, 0.46]),
+    ]);
+    expect(show(dropLoopbackBleed(words))).toBe("others:Because others:now");
+  });
+
+  it("keeps a single repeated word and anything outside the window", () => {
+    const words = byTime([
+      ...lane("others", "yes we should", [0, 0.4, 0.8]),
+      ...lane("me", "yes", [0.1]),
+      ...lane("me", "we should", [2.5, 2.9]),
+    ]);
+    expect(show(dropLoopbackBleed(words))).toBe(
+      "others:yes me:yes others:we others:should me:we me:should",
+    );
+  });
+
+  it("keeps the microphone's own words between echoed runs", () => {
+    const words = byTime([
+      ...lane("others", "so the plan is fine", [0, 0.3, 0.6, 0.9, 1.2]),
+      ...lane("me", "so the plan", [0.05, 0.35, 0.65]),
+      ...lane("me", "sure agreed", [1.0, 1.3]),
+      ...lane("me", "is fine", [1.6, 1.9]),
+    ]);
+    // "is fine" is too late to be the echo of the far end's "is fine".
+    expect(show(dropLoopbackBleed(words))).toBe(
+      "others:so others:the others:plan others:is me:sure others:fine me:agreed me:is me:fine",
+    );
+  });
+
+  it("matches in order so a shuffled coincidence is not an echo", () => {
+    const words = byTime([
+      ...lane("others", "one two", [0, 0.3]),
+      ...lane("me", "two one", [0.1, 0.4]),
+    ]);
+    // "two" matches others "two" (in window); "one" must then come after
+    // it in the loopback lane, and nothing does.
+    expect(show(dropLoopbackBleed(words))).toBe(
+      "others:one me:two others:two me:one",
+    );
+  });
+
+  it("leaves other lanes alone and honours the options", () => {
+    const mixed: LaneWord[] = lane("mixed", "a b", [0, 0.3]);
+    expect(dropLoopbackBleed(mixed)).toBe(mixed);
+    const words = byTime([
+      ...lane("others", "one two three", [0, 0.3, 0.6]),
+      ...lane("me", "one two three", [0.1, 0.4, 0.7]),
+    ]);
+    expect(show(dropLoopbackBleed(words, { minRun: 4 }))).toBe(
+      "others:one me:one others:two me:two others:three me:three",
+    );
+    expect(show(dropLoopbackBleed(words, { windowSeconds: 0.05 }))).toBe(
+      "others:one me:one others:two me:two others:three me:three",
+    );
   });
 });

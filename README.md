@@ -90,8 +90,11 @@ through one capture worklet, so they stay sample-aligned, and each is
 transcribed on its own: your words land in the note as `**Me:**` paragraphs
 and the other side's as `**Others:**` paragraphs, in the order they were
 spoken; a speaker who keeps talking across two chunks stays in one paragraph.
-Wear headphones — otherwise the microphone hears the other side through your
-speakers and their words show up under `Me` as well — and route the meeting's
+Wear headphones: otherwise the microphone hears the other side through your
+speakers as well. The plugin filters that echo — a run of two or more `Me`
+words that repeat `Others` words heard within about half a second is dropped
+— which removes most of it, but a word you both say at the same moment can be
+lost with it, so headphones remain the reliable setup. Also route the meeting's
 sound into the loopback device (see *System audio capture*: on macOS a
 Multi-Output Device with your headphones and BlackHole), or the `Others` lane
 stays silent. The browser's echo cancellation, noise suppression and gain

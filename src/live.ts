@@ -57,6 +57,79 @@ export function loopbackLane(source: LiveAudioSource): LiveLane | null {
   return null;
 }
 
+export interface BleedFilterOptions {
+  /** Largest start-time difference (seconds) between a word and its echo. */
+  windowSeconds?: number;
+  /** Shortest run of consecutive echoed `me` words that counts as bleed. */
+  minRun?: number;
+}
+
+export const DEFAULT_BLEED_FILTER: Required<BleedFilterOptions> = {
+  windowSeconds: 0.6,
+  minRun: 2,
+};
+
+/**
+ * Remove the microphone's copy of the far end. Without headphones the
+ * microphone hears the loudspeakers, so the loopback lane's words come back
+ * on the `me` lane a few tens of milliseconds apart, in either direction:
+ * the two capture paths buffer differently and Parakeet's timestamps are
+ * 80 ms frames. A `me` word is an echo when an `others` word with the same
+ * text (ignoring case and punctuation) starts within `windowSeconds` of it
+ * and the matches come in order; only runs of at least `minRun` consecutive
+ * echoes are dropped, so a genuine "yes" right after the far end's "yes"
+ * survives. Other lanes and the `others` lane itself are returned as they
+ * are, in the original order. Pure so it can be tested.
+ */
+export function dropLoopbackBleed(
+  words: LaneWord[],
+  opts: BleedFilterOptions = {},
+): LaneWord[] {
+  const windowSeconds = opts.windowSeconds ?? DEFAULT_BLEED_FILTER.windowSeconds;
+  const minRun = opts.minRun ?? DEFAULT_BLEED_FILTER.minRun;
+  const others = words
+    .filter((word) => word.lane === "others")
+    .map((word) => ({ key: normalizeTranscriptWord(word.text), start: word.start }));
+  if (others.length === 0) return words;
+
+  const meIndexes: number[] = [];
+  words.forEach((word, i) => {
+    if (word.lane === "me") meIndexes.push(i);
+  });
+  const matched: boolean[] = meIndexes.map(() => false);
+  let next = 0;
+  for (let k = 0; k < meIndexes.length; k++) {
+    const word = words[meIndexes[k]];
+    const key = normalizeTranscriptWord(word.text);
+    if (key.length === 0) continue;
+    while (next < others.length && others[next].start < word.start - windowSeconds) {
+      next++;
+    }
+    for (
+      let m = next;
+      m < others.length && others[m].start <= word.start + windowSeconds;
+      m++
+    ) {
+      if (others[m].key === key) {
+        matched[k] = true;
+        next = m + 1;
+        break;
+      }
+    }
+  }
+
+  const drop = new Set<number>();
+  let runStart = 0;
+  for (let k = 0; k <= meIndexes.length; k++) {
+    if (k < meIndexes.length && matched[k]) continue;
+    if (k - runStart >= minRun) {
+      for (let r = runStart; r < k; r++) drop.add(meIndexes[r]);
+    }
+    runStart = k + 1;
+  }
+  return drop.size === 0 ? words : words.filter((_, i) => !drop.has(i));
+}
+
 /**
  * Constraints that switch the browser's voice processing off for a loopback
  * device: system audio is already clean, and echo cancellation, noise

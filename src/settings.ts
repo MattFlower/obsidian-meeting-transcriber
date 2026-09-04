@@ -365,11 +365,14 @@ export class TranscriberSettingTab extends PluginSettingTab {
         );
 
       new Setting(containerEl)
-        .setName("Number of speakers")
+        .setName("Default number of speakers")
         .setDesc(
-          "0 detects the number of speakers automatically. Any other value " +
-            "is used as the exact number of speakers, not a maximum: set it " +
-            "only when you know how many people spoke.",
+          "Used when a note does not say. 0 detects the number of speakers " +
+            "automatically; any other value is used as the exact number of " +
+            "speakers, not a maximum. For one meeting, add a 'speakers' " +
+            "property with the number of people to its note instead (also " +
+            "while a live recording runs); the plugin records what it " +
+            "found there so the number is one edit away from a rerun.",
         )
         .addText((text) =>
           text

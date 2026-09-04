@@ -325,6 +325,26 @@ export function appendToTranscriptSection(
   return [...before, ...section, "", ...after].join("\n");
 }
 
+/** Frontmatter property naming how many people spoke in a note's recording. */
+export const SPEAKERS_PROPERTY = "speakers";
+
+/**
+ * The speaker count a note's `speakers:` property asks for: a non-negative
+ * integer (0 = detect automatically), also accepted as a numeric string.
+ * Anything else, including an absent property, is null so the caller falls
+ * back to the plugin default. Pure so it can be tested.
+ */
+export function speakerCountFromFrontmatter(value: unknown): number | null {
+  const n =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value)
+        : NaN;
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.floor(n);
+}
+
 /** A speaker turn as the live panel appends it: label ("" = none) and text. */
 export interface TranscriptTurn {
   speaker: string;

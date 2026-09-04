@@ -47,6 +47,8 @@ import {
   NO_SPEECH_MARKER,
   noteFileName,
   replaceTranscriptSection,
+  speakerCountFromFrontmatter,
+  SPEAKERS_PROPERTY,
   transcriptionNoteContent,
 } from "./note";
 import {
@@ -128,10 +130,19 @@ export const MAX_PLAUSIBLE_SPEAKERS = 12;
 function implausibleSpeakerCountMessage(speakers: number): string {
   return (
     `Speaker detection found ${speakers} speakers, far more than a meeting ` +
-    "has, so no labels were applied. Raise 'Clustering threshold' in the " +
-    "plugin settings (try 0.8) or set 'Number of speakers' to the real " +
-    "count, then run 'Assign speakers to transcript'."
+    `has, so no labels were applied. Add "${SPEAKERS_PROPERTY}: N" (the ` +
+    "number of people) to the note's properties, or raise 'Clustering " +
+    "threshold' in the plugin settings (try 0.8), then run 'Assign speakers " +
+    "to transcript'."
   );
+}
+
+/** Only automatic detection can overshoot; an exact count is the user's. */
+function isImplausibleSpeakerCount(
+  speakers: number,
+  opts: DiarizationOptions,
+): boolean {
+  return opts.numSpeakers <= 0 && speakers > MAX_PLAUSIBLE_SPEAKERS;
 }
 
 /** Suffix for a "done" Notice describing what the speaker pass found. */
@@ -365,6 +376,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
         return;
       }
       note = await this.createTranscriptionNote(file, text);
+      if (speakers !== null) await this.recordSpeakerCount(note, speakers);
       new Notice(`Transcribed ${file.name}${speakerSummary(speakers)}.`, 8000);
     } catch (e) {
       new Notice(
@@ -433,11 +445,40 @@ export default class MeetingTranscriberPlugin extends Plugin {
     return missingDiarizationModelFiles(dir, existsSync);
   }
 
-  private diarizationOptions(): DiarizationOptions {
+  /**
+   * Clustering options for one note: its `speakers:` property names the
+   * number of people when the user knows it (it can be added while a live
+   * recording runs), the plugin setting is only the default.
+   */
+  private diarizationOptionsFor(file: TFile | null): DiarizationOptions {
+    const fromNote = file
+      ? speakerCountFromFrontmatter(
+          this.app.metadataCache.getFileCache(file)?.frontmatter?.[
+            SPEAKERS_PROPERTY
+          ],
+        )
+      : null;
     return {
-      numSpeakers: this.settings.diarizationNumSpeakers,
+      numSpeakers: fromNote ?? this.settings.diarizationNumSpeakers,
       threshold: this.settings.diarizationThreshold,
     };
+  }
+
+  /**
+   * Record how many speakers a pass found in the note's properties, unless
+   * the note already says: the number is then one edit away from a rerun
+   * with the right count.
+   */
+  private async recordSpeakerCount(file: TFile, speakers: number): Promise<void> {
+    if (speakers < 2) return;
+    await this.app.fileManager
+      .processFrontMatter(file, (data) => {
+        const current = data[SPEAKERS_PROPERTY];
+        if (current === undefined || current === null || current === "") {
+          data[SPEAKERS_PROPERTY] = speakers;
+        }
+      })
+      .catch(() => undefined);
   }
 
   private async createTranscriptionNote(
@@ -624,7 +665,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
       );
       return { text: structured.text, speakers: null };
     }
-    return this.labelSpeakers(samples, structured, pluginDir, status, notice);
+    return this.labelSpeakers(
+      samples,
+      structured,
+      pluginDir,
+      status,
+      notice,
+      this.diarizationOptionsFor(null),
+    );
   }
 
   /** Diarize `samples` and render `structured` as speaker turns. */
@@ -634,6 +682,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     pluginDir: string,
     status: string,
     notice: Notice,
+    opts: DiarizationOptions,
   ): Promise<{ text: string; speakers: number | null }> {
     const diarizationDir = this.resolveDiarizationModelDir();
     if (!diarizationDir) {
@@ -651,24 +700,16 @@ export default class MeetingTranscriberPlugin extends Plugin {
       samples,
       diarizationDir,
       pluginDir,
-      this.diarizationOptions(),
+      opts,
       ({ processed, total }) =>
         report(total > 0 ? Math.round((processed / total) * 100) : null),
     );
     const result = speakerTranscript(structured.words, segments);
-    if (this.isImplausibleSpeakerCount(result.speakers)) {
+    if (isImplausibleSpeakerCount(result.speakers, opts)) {
       new Notice(implausibleSpeakerCountMessage(result.speakers), 20000);
       return { text: structured.text, speakers: null };
     }
     return { text: result.text || structured.text, speakers: result.speakers };
-  }
-
-  /** Only automatic detection can overshoot; an exact count is the user's. */
-  private isImplausibleSpeakerCount(speakers: number): boolean {
-    return (
-      this.settings.diarizationNumSpeakers <= 0 &&
-      speakers > MAX_PLAUSIBLE_SPEAKERS
-    );
   }
 
   private async assignSpeakersActiveOrSuggested(): Promise<void> {
@@ -901,11 +942,12 @@ export default class MeetingTranscriberPlugin extends Plugin {
         notice.messageEl.setText(`Assigning speakers…${suffix}`);
         this.setStatus(status, `Assigning speakers${suffix}`);
       };
+      const opts = this.diarizationOptionsFor(note);
       const segments = await diarize(
         pcm,
         diarizationDir,
         pluginDir,
-        this.diarizationOptions(),
+        opts,
         ({ processed, total }) =>
           report(total > 0 ? Math.round((processed / total) * 100) : null),
       );
@@ -924,8 +966,8 @@ export default class MeetingTranscriberPlugin extends Plugin {
         done = true;
         return;
       }
-      if (this.isImplausibleSpeakerCount(result.speakers)) {
-        // Keep the audio: the fix is a settings change and a rerun.
+      if (isImplausibleSpeakerCount(result.speakers, opts)) {
+        // Keep the audio: the fix is a property or settings change and a rerun.
         await keepForRetry(implausibleSpeakerCountMessage(result.speakers));
         return;
       }
@@ -943,6 +985,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
         return;
       }
       done = true;
+      await this.recordSpeakerCount(note, result.speakers);
       new Notice(
         `Assigned speakers in ${note.name}${speakerSummary(result.speakers)}.`,
         8000,
@@ -1034,6 +1077,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
         pluginDir,
         status,
         notice,
+        this.diarizationOptionsFor(file),
       );
       // Same optimistic guard as normalization: the note is re-read under
       // Obsidian's write lock and left alone if its transcript changed.
@@ -1052,6 +1096,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
         return;
       }
       await this.discardKeptAudio(file);
+      if (speakers !== null) await this.recordSpeakerCount(file, speakers);
       new Notice(
         `Assigned speakers in ${file.name}${speakerSummary(speakers)}.`,
         8000,

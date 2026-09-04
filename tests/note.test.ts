@@ -17,6 +17,7 @@ import {
   transcriptionNoteContent,
   linkTargetFromFrontmatterValue,
   appendTurnsToTranscriptSection,
+  speakerCountFromFrontmatter,
 } from "../src/note";
 
 const sampleNote = transcriptionNoteContent({
@@ -519,5 +520,24 @@ describe("appendTurnsToTranscriptSection", () => {
       "**Me:** hello again\n\n**Alice:** new voice",
     );
     expect(md).toContain("## Summary\n\n**Me:** not transcript");
+  });
+});
+
+describe("speakerCountFromFrontmatter", () => {
+  it("accepts a non-negative integer, also as a string, flooring fractions", () => {
+    expect(speakerCountFromFrontmatter(5)).toBe(5);
+    expect(speakerCountFromFrontmatter("3")).toBe(3);
+    expect(speakerCountFromFrontmatter(" 4 ")).toBe(4);
+    expect(speakerCountFromFrontmatter(2.7)).toBe(2);
+    expect(speakerCountFromFrontmatter(0)).toBe(0);
+  });
+
+  it("returns null for anything that is not a usable count", () => {
+    expect(speakerCountFromFrontmatter(undefined)).toBeNull();
+    expect(speakerCountFromFrontmatter(null)).toBeNull();
+    expect(speakerCountFromFrontmatter("")).toBeNull();
+    expect(speakerCountFromFrontmatter("five")).toBeNull();
+    expect(speakerCountFromFrontmatter(-1)).toBeNull();
+    expect(speakerCountFromFrontmatter([5])).toBeNull();
   });
 });

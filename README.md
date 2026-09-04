@@ -319,9 +319,15 @@ Then:
   windows cut at quiet points for long recordings. A re-run resets speaker
   names you edited by hand back to `Speaker N`.
 
-Two settings tune the clustering. **Number of speakers** is `0` to detect the
-count automatically; any other value is used as the *exact* number of
-speakers, not a maximum, so set it only when you know how many people spoke.
+**How many people spoke** is a property of the meeting, so it lives on the
+note: add `speakers: 5` to the note's properties (in the Properties panel or
+the frontmatter) and the pass clusters into exactly that many voices. You can
+add it while a live recording is running, and after a run the plugin records
+the number it found there, so a wrong count is one edit and one rerun of
+**Assign speakers to transcript** away. The value is *exact*, not a maximum;
+`0` means detect automatically. The **Default number of speakers** setting
+applies when a note does not say (a freshly transcribed audio file has no
+note yet, so it always uses the default; correct the property and rerun).
 **Clustering threshold** (default `0.5`) applies to automatic detection.
 sherpa-onnx clusters the voice embeddings with complete-linkage hierarchical
 clustering cut at this cosine distance, so a cluster only survives when
@@ -374,7 +380,7 @@ licences.
 | Live chunk length (seconds) | `15` | How often live audio is transcribed and appended to the note (5–60) |
 | Assign speakers to transcripts | off | Master switch for speaker diarization (see *Speaker diarization*) |
 | Diarization model directory | `models/diarization` | Vault-relative folder with the segmentation and embedding models |
-| Number of speakers | `0` | `0` detects the count automatically; any other value is the exact number of speakers |
+| Default number of speakers | `0` | Used when a note has no `speakers` property: `0` detects the count automatically; any other value is the exact number of speakers |
 | Clustering threshold | `0.5` | For automatic detection: raise it if one person is split, lower it if two are merged |
 | Assign speakers to live recordings when they stop | on | Record a live session's audio to a temporary file outside the vault and run the pass when it stops (when the master switch is on) |
 | Normalize transcripts with S1-mini by Superwhisper | off | Master switch for transcript normalization (see *Text normalization*) |

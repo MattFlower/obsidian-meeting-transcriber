@@ -25,7 +25,8 @@ normalization* below).
 - **Meeting Transcriber: Transcribe meeting audio to note** — pick an audio
   file in the vault (mp3, wav, m4a, flac, ogg, aac, opus); a note is created
   in the output folder (default `Meetings/`) with frontmatter
-  (`tags`, `description`, `source`, `date`) and a `## Transcript` section.
+  (`tags`, `description`, `source`, `date`, and `speakers` when the speaker
+  pass is on) and a `## Transcript` section.
 - **Meeting Transcriber: Download Parakeet model** — fetches
   `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`, `tokens.txt`
   from Hugging Face
@@ -320,11 +321,12 @@ Then:
   names you edited by hand back to `Speaker N`.
 
 **How many people spoke** is a property of the meeting, so it lives on the
-note: add `speakers: 5` to the note's properties (in the Properties panel or
-the frontmatter) and the pass clusters into exactly that many voices. You can
-add it while a live recording is running, and after a run the plugin records
-the number it found there, so a wrong count is one edit and one rerun of
-**Assign speakers to transcript** away. The value is *exact*, not a maximum;
+note: with the speaker pass on, every new note gets a `speakers` property.
+Fill it in (in the Properties panel or the frontmatter), for example
+`speakers: 5`, and the pass clusters into exactly that many voices. You can
+fill it in while a live recording is running, and after a run the plugin
+records the number it found there, so a wrong count is one edit and one rerun
+of **Assign speakers to transcript** away. The value is *exact*, not a maximum;
 `0` means detect automatically. The **Default number of speakers** setting
 applies when a note does not say (a freshly transcribed audio file has no
 note yet, so it always uses the default; correct the property and rerun).

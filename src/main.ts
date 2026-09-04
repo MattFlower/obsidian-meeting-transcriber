@@ -375,8 +375,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
         new Notice("Transcription produced no text.", 10000);
         return;
       }
-      note = await this.createTranscriptionNote(file, text);
-      if (speakers !== null) await this.recordSpeakerCount(note, speakers);
+      note = await this.createTranscriptionNote(file, text, speakers);
       new Notice(`Transcribed ${file.name}${speakerSummary(speakers)}.`, 8000);
     } catch (e) {
       new Notice(
@@ -484,8 +483,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
   private async createTranscriptionNote(
     file: TFile,
     transcript: string,
+    speakers: number | null,
   ): Promise<TFile> {
-    return this.createNote(file.basename, `[[${file.path}]]`, transcript);
+    return this.createNote(
+      file.basename,
+      `[[${file.path}]]`,
+      transcript,
+      speakers,
+    );
   }
 
   /**
@@ -498,6 +503,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
     baseName: string,
     sourceLabel: string,
     transcript: string,
+    speakers: number | null = null,
   ): Promise<TFile> {
     const vault = this.app.vault;
     const folder = this.settings.outputFolder.replace(/^\/+|\/+$/g, "");
@@ -520,12 +526,22 @@ export default class MeetingTranscriberPlugin extends Plugin {
     // Title, frontmatter date, and file name all use local time so they agree
     // on the calendar day; toISOString() is UTC and can already be tomorrow.
     const title = `${formatLocalDate(now)} ${baseName}`;
+    // With the speaker pass on, every note carries a `speakers` property:
+    // the count the pass found, or an empty one inviting the user to fill
+    // it in (also while a live recording runs). One found voice is not
+    // recorded, so a rerun is not pinned to it.
+    const speakersProperty = this.settings.diarizationEnabled
+      ? speakers !== null && speakers >= 2
+        ? speakers
+        : null
+      : undefined;
     const content = transcriptionNoteContent({
       title,
       date: `${formatLocalDate(now)} ${formatLocalTime(now)}`,
       audioLink: sourceLabel,
       transcript,
       tags: [...this.settings.defaultTags],
+      speakers: speakersProperty,
     });
 
     // Avoid clobbering an existing note with the same name.

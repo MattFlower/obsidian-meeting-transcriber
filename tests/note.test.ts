@@ -541,3 +541,30 @@ describe("speakerCountFromFrontmatter", () => {
     expect(speakerCountFromFrontmatter([5])).toBeNull();
   });
 });
+
+describe("transcriptionNoteContent speakers property", () => {
+  const base = {
+    title: "T",
+    date: "2026-09-03 09:00",
+    audioLink: "[[a.m4a]]",
+    transcript: "hi",
+    tags: ["meeting"],
+  };
+
+  it("omits the property when the speaker pass is off", () => {
+    expect(transcriptionNoteContent(base)).not.toContain("speakers");
+  });
+
+  it("emits an empty property for the user to fill in", () => {
+    const md = transcriptionNoteContent({ ...base, speakers: null });
+    expect(md).toContain('date: "2026-09-03 09:00"\nspeakers:\n---');
+    // The plugin's own parser reads it back as "no count".
+    expect(speakerCountFromFrontmatter(parseFrontmatter(md).data.speakers)).toBeNull();
+  });
+
+  it("records a found count", () => {
+    const md = transcriptionNoteContent({ ...base, speakers: 4 });
+    expect(md).toContain("speakers: 4\n---");
+    expect(speakerCountFromFrontmatter(parseFrontmatter(md).data.speakers)).toBe(4);
+  });
+});

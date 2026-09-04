@@ -8,6 +8,8 @@ export interface FrontmatterData {
   description?: string;
   source?: string;
   date?: string;
+  /** Speaker count; null emits an empty property for the user to fill in. */
+  speakers?: number | null;
   [key: string]: unknown;
 }
 
@@ -102,6 +104,11 @@ export function emitFrontmatter(data: FrontmatterData): string {
   const lines: string[] = ["---"];
   for (const [key, value] of Object.entries(data)) {
     if (value === undefined) continue;
+    if (value === null) {
+      // An empty property: visible in Obsidian's Properties panel, no value.
+      lines.push(`${key}:`);
+      continue;
+    }
     if (Array.isArray(value)) {
       if (value.length === 0) {
         lines.push(`${key}: []`);
@@ -151,6 +158,11 @@ export interface TranscriptionNoteInput {
   audioLink: string;
   transcript: string;
   tags: string[];
+  /**
+   * `speakers` property: a number the speaker pass found, null for an empty
+   * property the user can fill in, undefined for none (speaker pass off).
+   */
+  speakers?: number | null;
 }
 
 /**
@@ -166,6 +178,7 @@ export function transcriptionNoteContent(
     description: "",
     source: input.audioLink,
     date: input.date,
+    speakers: input.speakers,
   };
   const fm = emitFrontmatter(data);
   const transcript = input.transcript.trim();
